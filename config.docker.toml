@@ -1,0 +1,18 @@
+http_port = 9081
+
+[db]
+dsn = "host=postgres user=yantube password=yantube_secret dbname=yantube port=5432 sslmode=disable"
+
+[user]
+allow_register = true
+auth_realm = "stream api"
+auth_secret = "change-me-in-production"
+
+[srs]
+api_url = "http://srs:1985"
+api_user = "admin"
+api_password = "admin"
+callback_secret = "srs-callback-secret-change-me"
+
+[metrics]
+enabled = true

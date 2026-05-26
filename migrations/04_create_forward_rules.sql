@@ -1,0 +1,10 @@
+CREATE TABLE forward_rule (
+    id SERIAL PRIMARY KEY,
+    stream_filter VARCHAR(256) NOT NULL DEFAULT '*',
+    target_url VARCHAR(512) NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_forward_rule_enabled ON forward_rule(enabled);
+CREATE INDEX idx_forward_rule_filter ON forward_rule(stream_filter);
