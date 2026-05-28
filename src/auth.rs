@@ -9,12 +9,15 @@ use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 const JWT_EXPIRATION_HOURS: i64 = 1;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub username: String,
+    pub user_id: i32,
+    pub role: String,
     pub exp: usize,
     pub iat: usize,
 }
@@ -22,6 +25,8 @@ pub struct Claims {
 #[derive(Debug, Clone)]
 pub struct CurrentUser {
     pub username: String,
+    pub user_id: i32,
+    pub role: String,
 }
 
 #[axum::async_trait]
@@ -58,21 +63,26 @@ where
             .map(|s| s.0.as_str())
             .unwrap_or("");
 
-        let token_data =
-            decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &Validation::default())
-                .map_err(|_| {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({
-                            "code": 401,
-                            "msg": "invalid token",
-                            "data": null
-                        })),
-                    )
-                })?;
+        let token_data = decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &Validation::default(),
+        )
+        .map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "code": 401,
+                    "msg": "invalid token",
+                    "data": null
+                })),
+            )
+        })?;
 
         Ok(CurrentUser {
             username: token_data.claims.username,
+            user_id: token_data.claims.user_id,
+            role: token_data.claims.role,
         })
     }
 }
@@ -80,10 +90,17 @@ where
 #[derive(Clone)]
 pub struct JwtSecret(pub String);
 
-pub fn create_jwt(username: &str, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn create_jwt(
+    user_id: i32,
+    username: &str,
+    role: &str,
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let now = Utc::now();
     let claims = Claims {
         username: username.to_string(),
+        user_id,
+        role: role.to_string(),
         iat: now.timestamp() as usize,
         exp: (now + Duration::hours(JWT_EXPIRATION_HOURS)).timestamp() as usize,
     };
@@ -105,8 +122,8 @@ pub fn hash_password(password: &str) -> String {
     let mut hash = [0u8; 32]; // SHA256 output
     pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, 100_000, &mut hash);
 
-    let salt_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &salt);
-    let hash_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &hash);
+    let salt_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, salt);
+    let hash_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash);
 
     format!("sha256$32$100000${}${}", salt_b64, hash_b64)
 }
@@ -134,16 +151,21 @@ pub fn verify_password(stored: &str, password: &str) -> Result<bool, String> {
     let mut computed_hash = vec![0u8; stored_hash.len()];
     pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut computed_hash);
 
-    Ok(computed_hash == stored_hash)
+    Ok(computed_hash.ct_eq(&stored_hash).into())
 }
 
 pub fn generate_random_string(length: usize) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const MASK: usize = 64 - 1; // next power of two above 62, minus 1
     let mut result = String::with_capacity(length);
     let mut rng = rand::rngs::OsRng;
-    for _ in 0..length {
-        let idx = (rng.next_u32() as usize) % CHARSET.len();
-        result.push(CHARSET[idx] as char);
+    let mut buf = [0u8; 1];
+    while result.len() < length {
+        rng.fill_bytes(&mut buf);
+        let idx = (buf[0] as usize) & MASK;
+        if idx < CHARSET.len() {
+            result.push(CHARSET[idx] as char);
+        }
     }
     result
 }

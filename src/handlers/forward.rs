@@ -6,23 +6,21 @@ use axum::{
 };
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use serde::Deserialize;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tracing::{error, info};
+use url::Url;
 
 use crate::entities::forward_rule;
 use crate::response::{error_response, success_response};
 use crate::AppState;
 
 // GET /api/live/forward/rules
-pub async fn list(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let rules = forward_rule::Entity::find().all(&state.db).await;
 
     match rules {
-        Ok(list) => {
-            (StatusCode::OK, success_response(list))
-        }
+        Ok(list) => (StatusCode::OK, success_response(list)),
         Err(e) => {
             error!("Failed to list forward rules: {}", e);
             (
@@ -39,11 +37,46 @@ pub struct AddForwardRuleRequest {
     pub target_url: String,
 }
 
+fn validate_forward_url(url_str: &str) -> Result<(), String> {
+    let parsed = Url::parse(url_str).map_err(|e| format!("invalid URL: {}", e))?;
+    let host = parsed.host_str().ok_or("URL must have a host")?;
+
+    // Reject localhost and zero-address
+    if host == "localhost" || host == "0.0.0.0" {
+        return Err("forward URL cannot point to localhost".into());
+    }
+
+    // Reject private, loopback, and link-local IPs
+    if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
+        if ipv4.is_private() || ipv4.is_loopback() || ipv4.is_link_local() {
+            return Err("forward URL cannot point to a private or loopback address".into());
+        }
+    }
+    if let Ok(ipv6) = host.parse::<Ipv6Addr>() {
+        if ipv6.is_loopback() {
+            return Err("forward URL cannot point to a loopback address".into());
+        }
+    }
+
+    // Only allow RTMP/HTTP(S) schemes
+    match parsed.scheme() {
+        "rtmp" | "rtmps" | "http" | "https" => {}
+        _ => return Err(format!("unsupported forward scheme: {}", parsed.scheme())),
+    }
+
+    Ok(())
+}
+
 // POST /api/live/forward/rules
 pub async fn add(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddForwardRuleRequest>,
 ) -> impl IntoResponse {
+    // Validate target_url to prevent SSRF
+    if let Err(msg) = validate_forward_url(&req.target_url) {
+        return (StatusCode::BAD_REQUEST, error_response(400, msg));
+    }
+
     let now = chrono::Utc::now().naive_utc();
 
     let rule = forward_rule::ActiveModel {
@@ -71,18 +104,21 @@ pub async fn add(
 }
 
 // DELETE /api/live/forward/rules/:id
-pub async fn delete(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i32>,
-) -> impl IntoResponse {
+pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<i32>) -> impl IntoResponse {
     let result = forward_rule::Entity::delete_by_id(id).exec(&state.db).await;
 
     match result {
         Ok(res) => {
             if res.rows_affected == 0 {
-                return (StatusCode::BAD_REQUEST, error_response(400, "forward rule not found"));
+                return (
+                    StatusCode::BAD_REQUEST,
+                    error_response(400, "forward rule not found"),
+                );
             }
-            (StatusCode::OK, success_response(serde_json::json!({"deleted": true})))
+            (
+                StatusCode::OK,
+                success_response(serde_json::json!({"deleted": true})),
+            )
         }
         Err(e) => {
             error!("Failed to delete forward rule: {}", e);

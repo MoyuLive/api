@@ -1,15 +1,15 @@
+mod auth;
 mod config;
 mod db;
 mod entities;
-mod auth;
+mod handlers;
 mod response;
 mod srs_client;
-mod handlers;
 
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{header, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post},
@@ -18,7 +18,7 @@ use axum::{
 use clap::Parser;
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -57,6 +57,47 @@ async fn jwt_auth_middleware(
     }
 }
 
+// SRS callback secret validation middleware — protects internal SRS callback routes
+async fn validate_callback_secret(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let secret = &state.config.srs.callback_secret;
+
+    // If callback_secret is not configured, allow all (backward compatibility)
+    if secret.is_empty() {
+        return Ok(next.run(req).await);
+    }
+
+    // Check X-SRS-Callback-Secret header first
+    let header_match = req
+        .headers()
+        .get("x-srs-callback-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == secret)
+        .unwrap_or(false);
+
+    // Check query param callback_secret
+    let query_match = req
+        .uri()
+        .query()
+        .map(|q| {
+            q.split('&').any(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                parts.next() == Some("callback_secret") && parts.next() == Some(secret.as_str())
+            })
+        })
+        .unwrap_or(false);
+
+    if header_match || query_match {
+        Ok(next.run(req).await)
+    } else {
+        tracing::warn!("validate_callback_secret: secret mismatch or missing, returning 403");
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -87,7 +128,11 @@ async fn main() {
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/api/account/create", post(handlers::account::create))
-        .route("/api/account/login", post(handlers::account::login))
+        .route("/api/account/login", post(handlers::account::login));
+
+    // SRS callback routes — protected by callback_secret middleware
+    let srs_state = state.clone();
+    let srs_callback_routes = Router::new()
         .route(
             "/api/internal/srs/on_publish",
             post(handlers::srs_callback::on_publish),
@@ -107,7 +152,11 @@ async fn main() {
         .route(
             "/api/internal/srs/heartbeat",
             post(handlers::srs_callback::heartbeat),
-        );
+        )
+        .route_layer(middleware::from_fn_with_state(
+            srs_state,
+            validate_callback_secret,
+        ));
 
     // JWT-protected routes
     let protected_routes = Router::new()
@@ -124,14 +173,8 @@ async fn main() {
         )
         .route("/api/live/stream/stop", post(handlers::live::stop_stream))
         .route("/api/live/stream/list", get(handlers::live::stream_list))
-        .route(
-            "/api/live/forward/rules",
-            get(handlers::forward::list),
-        )
-        .route(
-            "/api/live/forward/rules",
-            post(handlers::forward::add),
-        )
+        .route("/api/live/forward/rules", get(handlers::forward::list))
+        .route("/api/live/forward/rules", post(handlers::forward::add))
         .route(
             "/api/live/forward/rules/:id",
             delete(handlers::forward::delete),
@@ -142,15 +185,30 @@ async fn main() {
             jwt_auth_middleware,
         ));
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let origins: Vec<HeaderValue> = state
+        .config
+        .cors_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    let cors_layer = if origins.is_empty() {
+        tracing::warn!("No cors_origins configured, falling back to Any for dev convenience");
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    } else {
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    };
 
     let app = Router::new()
         .merge(public_routes)
+        .merge(srs_callback_routes)
         .merge(protected_routes)
-        .layer(cors)
+        .layer(cors_layer)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

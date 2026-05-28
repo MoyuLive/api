@@ -1,4 +1,4 @@
-CREATE TABLE srs_server (
+CREATE TABLE IF NOT EXISTS srs_server (
     id SERIAL PRIMARY KEY,
     device_id VARCHAR(128) NOT NULL UNIQUE,
     ip VARCHAR(64) NOT NULL DEFAULT '',
@@ -8,4 +8,4 @@ CREATE TABLE srs_server (
     mem_usage REAL NOT NULL DEFAULT 0,
     uptime_seconds BIGINT NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_srs_server_active ON srs_server(is_active);
+CREATE INDEX IF NOT EXISTS idx_srs_server_active ON srs_server(is_active);

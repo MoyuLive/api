@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub user: UserConfig,
     pub srs: SrsConfig,
     pub metrics: MetricsConfig,
+    #[serde(default = "default_cors_origins")]
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -65,13 +67,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_cors_origins() -> Vec<String> {
+    vec!["http://localhost:5173".to_string()]
+}
+
 pub fn load_config(config_path: &str) -> Result<Arc<AppConfig>, ConfigError> {
     let settings = ConfigRs::builder()
         .add_source(File::with_name(config_path).required(false))
-        .add_source(
-            config::Environment::with_prefix("STREAM_API")
-                .separator("__"),
-        )
+        .add_source(config::Environment::with_prefix("STREAM_API").separator("_"))
         .build()?;
 
     let cfg: AppConfig = settings.try_deserialize()?;

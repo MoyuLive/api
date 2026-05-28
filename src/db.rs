@@ -1,21 +1,39 @@
-use sea_orm::{Database, DatabaseConnection};
-use sqlx::migrate::Migrator;
+use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use tracing::info;
 
-static MIGRATOR: Migrator = sqlx::migrate!();
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/01_create_users.sql"),
+    include_str!("../migrations/02_create_srs_servers.sql"),
+    include_str!("../migrations/03_create_live_sessions.sql"),
+    include_str!("../migrations/04_create_forward_rules.sql"),
+];
 
 pub async fn init_db(dsn: &str) -> DatabaseConnection {
     info!("Connecting to database...");
     let url = to_postgres_url(dsn);
 
-    let pool = sqlx::PgPool::connect(&url).await.expect("Failed to create pool");
-    MIGRATOR.run(&pool).await.expect("Failed to run migrations");
-    info!("Database migration complete");
+    let db = Database::connect(&url)
+        .await
+        .expect("Failed to connect sea-orm");
 
-    let db = Database::connect(&url).await.expect("Failed to connect sea-orm");
+    run_migrations(&db).await;
+
     db.ping().await.expect("Failed to ping database");
     info!("Database connected successfully");
     db
+}
+
+async fn run_migrations(db: &DatabaseConnection) {
+    for (i, sql) in MIGRATIONS.iter().enumerate() {
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            (*sql).to_string(),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("Migration {} failed: {}", i + 1, e));
+    }
+    info!("Database migration complete");
 }
 
 fn to_postgres_url(dsn: &str) -> String {
@@ -41,6 +59,10 @@ fn to_postgres_url(dsn: &str) -> String {
     if password.is_empty() {
         format!("postgres://{}@{}:{}/{}", user, host, port, dbname)
     } else {
-        format!("postgres://{}:{}@{}:{}/{}", user, password, host, port, dbname)
+        let encoded_pw: String = percent_encode(password.as_bytes(), NON_ALPHANUMERIC).collect();
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            user, encoded_pw, host, port, dbname
+        )
     }
 }

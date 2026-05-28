@@ -1,4 +1,4 @@
-CREATE TABLE live_session (
+CREATE TABLE IF NOT EXISTS live_session (
     id SERIAL PRIMARY KEY,
     stream_id VARCHAR(256) NOT NULL UNIQUE,
     app VARCHAR(64) NOT NULL DEFAULT 'live',
@@ -15,5 +15,5 @@ CREATE TABLE live_session (
     started_at TIMESTAMP NOT NULL DEFAULT NOW(),
     ended_at TIMESTAMP
 );
-CREATE INDEX idx_live_session_status ON live_session(status);
-CREATE INDEX idx_live_session_user ON live_session(user_id);
+CREATE INDEX IF NOT EXISTS idx_live_session_status ON live_session(status);
+CREATE INDEX IF NOT EXISTS idx_live_session_user ON live_session(user_id);

@@ -1,3 +1,4 @@
+use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +66,8 @@ pub struct SrsStreamsData {
 impl SrsClient {
     pub fn new(base_url: String, username: String, password: String) -> Self {
         let auth = format!("{}:{}", username, password);
-        let auth_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth.as_bytes());
+        let auth_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth.as_bytes());
         let auth_header = format!("Basic {}", auth_b64);
 
         SrsClient {
@@ -82,11 +84,20 @@ impl SrsClient {
         let url = format!("{}{}", self.base_url, path);
         let req = self
             .http_client
-            .request(method.parse().unwrap(), &url)
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).expect("valid HTTP method"),
+                &url,
+            )
             .header("Authorization", &self.auth_header);
 
-        let resp = req.send().await.map_err(|e| format!("request failed: {}", e))?;
-        let body = resp.text().await.map_err(|e| format!("read body failed: {}", e))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {}", e))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("read body failed: {}", e))?;
         Ok(body)
     }
 
@@ -100,7 +111,8 @@ impl SrsClient {
             data: Option<SrsStreamsData>,
         }
 
-        let resp: Wrapper = serde_json::from_str(&body).map_err(|e| format!("parse error: {}", e))?;
+        let resp: Wrapper =
+            serde_json::from_str(&body).map_err(|e| format!("parse error: {}", e))?;
         if resp.code != 0 {
             return Err(format!("SRS API error: code={}", resp.code));
         }
@@ -109,7 +121,8 @@ impl SrsClient {
     }
 
     pub async fn get_stream(&self, stream_id: &str) -> Result<Option<SrsStream>, String> {
-        let path = format!("/api/v1/streams/{}/", stream_id);
+        let encoded_id: String = percent_encode(stream_id.as_bytes(), NON_ALPHANUMERIC).collect();
+        let path = format!("/api/v1/streams/{}/", encoded_id);
         let body = self.do_request("GET", &path).await?;
 
         #[derive(Deserialize)]
@@ -118,7 +131,8 @@ impl SrsClient {
             data: Option<SrsStream>,
         }
 
-        let resp: Wrapper = serde_json::from_str(&body).map_err(|e| format!("parse error: {}", e))?;
+        let resp: Wrapper =
+            serde_json::from_str(&body).map_err(|e| format!("parse error: {}", e))?;
         if resp.code != 0 {
             return Err(format!("SRS API error: code={}", resp.code));
         }
@@ -127,7 +141,8 @@ impl SrsClient {
     }
 
     pub async fn kick_client(&self, client_id: &str) -> Result<(), String> {
-        let path = format!("/api/v1/clients/{}/", client_id);
+        let encoded_id: String = percent_encode(client_id.as_bytes(), NON_ALPHANUMERIC).collect();
+        let path = format!("/api/v1/clients/{}/", encoded_id);
         let body = self.do_request("DELETE", &path).await?;
 
         let resp: SrsApiResponse =
