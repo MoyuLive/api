@@ -74,9 +74,89 @@ fn default_cors_origins() -> Vec<String> {
 pub fn load_config(config_path: &str) -> Result<Arc<AppConfig>, ConfigError> {
     let settings = ConfigRs::builder()
         .add_source(File::with_name(config_path).required(false))
-        .add_source(config::Environment::with_prefix("STREAM_API").separator("_"))
+        .add_source(
+            config::Environment::with_prefix("STREAM_API")
+                .prefix_separator("_")
+                .separator("__")
+                .try_parsing(true),
+        )
         .build()?;
 
     let cfg: AppConfig = settings.try_deserialize()?;
     Ok(Arc::new(cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const TEST_ENV_KEYS: &[&str] = &[
+        "STREAM_API_HTTP_PORT",
+        "STREAM_API_DB__DSN",
+        "STREAM_API_USER__ALLOW_REGISTER",
+        "STREAM_API_USER__AUTH_SECRET",
+        "STREAM_API_SRS__API_URL",
+        "STREAM_API_SRS__API_USER",
+        "STREAM_API_SRS__API_PASSWORD",
+        "STREAM_API_SRS__CALLBACK_SECRET",
+        "STREAM_API_METRICS__ENABLED",
+    ];
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for key in TEST_ENV_KEYS {
+                env::remove_var(key);
+            }
+        }
+    }
+
+    fn with_clean_env() -> EnvGuard {
+        let guard = ENV_LOCK.lock().expect("env lock poisoned");
+        for key in TEST_ENV_KEYS {
+            env::remove_var(key);
+        }
+        EnvGuard { _lock: guard }
+    }
+
+    #[test]
+    fn loads_nested_config_from_double_underscore_env_vars() {
+        let _guard = with_clean_env();
+
+        env::set_var("STREAM_API_HTTP_PORT", "19081");
+        env::set_var(
+            "STREAM_API_DB__DSN",
+            "host=postgres user=yantube password=secret dbname=yantube port=5432 sslmode=disable",
+        );
+        env::set_var("STREAM_API_USER__ALLOW_REGISTER", "false");
+        env::set_var("STREAM_API_USER__AUTH_SECRET", "jwt-secret");
+        env::set_var("STREAM_API_SRS__API_URL", "http://srs:1985");
+        env::set_var("STREAM_API_SRS__API_USER", "srs-admin");
+        env::set_var("STREAM_API_SRS__API_PASSWORD", "srs-password");
+        env::set_var("STREAM_API_SRS__CALLBACK_SECRET", "callback-secret");
+        env::set_var("STREAM_API_METRICS__ENABLED", "false");
+
+        let config = load_config("/private/tmp/moyulive-missing-config.toml")
+            .expect("double underscore env vars should load config");
+
+        assert_eq!(config.http_port, 19081);
+        assert_eq!(
+            config.db.dsn,
+            "host=postgres user=yantube password=secret dbname=yantube port=5432 sslmode=disable"
+        );
+        assert!(!config.user.allow_register);
+        assert_eq!(config.user.auth_secret, "jwt-secret");
+        assert_eq!(config.srs.api_url, "http://srs:1985");
+        assert_eq!(config.srs.api_user, "srs-admin");
+        assert_eq!(config.srs.api_password, "srs-password");
+        assert_eq!(config.srs.callback_secret, "callback-secret");
+        assert!(!config.metrics.enabled);
+    }
 }

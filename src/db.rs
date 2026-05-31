@@ -1,5 +1,5 @@
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 use tracing::info;
 
 const MIGRATIONS: &[&str] = &[
@@ -26,12 +26,9 @@ pub async fn init_db(dsn: &str) -> DatabaseConnection {
 
 async fn run_migrations(db: &DatabaseConnection) {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
-        db.execute(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            (*sql).to_string(),
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("Migration {} failed: {}", i + 1, e));
+        db.execute_unprepared(sql)
+            .await
+            .unwrap_or_else(|e| panic!("Migration {} failed: {}", i + 1, e));
     }
     info!("Database migration complete");
 }
@@ -64,5 +61,24 @@ fn to_postgres_url(dsn: &str) -> String {
             "postgres://{}:{}@{}:{}/{}",
             user, encoded_pw, host, port, dbname
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bundled_migrations_execute_against_postgres() {
+        let Ok(database_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
+            eprintln!("skipping postgres migration test; YANTUBE_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let db = Database::connect(&database_url)
+            .await
+            .expect("test database should be reachable");
+
+        run_migrations(&db).await;
     }
 }

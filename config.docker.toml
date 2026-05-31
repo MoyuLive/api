@@ -1,7 +1,8 @@
 # WARNING: Default values are for local development ONLY.
 # Override in production via environment variables:
-#   STREAM_API_DB_DSN, STREAM_API_USER_AUTH_SECRET,
-#   STREAM_API_SRS_CALLBACK_SECRET
+#   STREAM_API_DB__DSN, STREAM_API_USER__AUTH_SECRET,
+#   STREAM_API_SRS__API_PASSWORD, STREAM_API_SRS__CALLBACK_SECRET
+# Nested config keys use double underscores in environment variables.
 
 http_port = 9081
 
@@ -9,17 +10,17 @@ http_port = 9081
 dsn = "host=postgres user=yantube password=yantube_dev_password dbname=yantube port=5432 sslmode=disable"
 
 [user]
-allow_register = true
+allow_register = false
 auth_realm = "stream api"
-# Set via STREAM_API_USER_AUTH_SECRET env var in production
+# Set via STREAM_API_USER__AUTH_SECRET env var in production
 auth_secret = "change-me-in-production"
 
 [srs]
 api_url = "http://srs:1985"
 api_user = "admin"
-# WARNING: Change in production via STREAM_API_SRS_API_PASSWORD
+# WARNING: Change in production via STREAM_API_SRS__API_PASSWORD
 api_password = "srs_admin_change_me"
-# Set via STREAM_API_SRS_CALLBACK_SECRET env var in production
+# Set via STREAM_API_SRS__CALLBACK_SECRET env var in production
 callback_secret = "srs-callback-secret-change-me"
 
 [metrics]
