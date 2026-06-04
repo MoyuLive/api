@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub db: DbConfig,
     pub user: UserConfig,
     pub srs: SrsConfig,
+    #[serde(default = "default_playback_config")]
+    pub playback: PlaybackConfig,
     pub metrics: MetricsConfig,
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
@@ -55,6 +57,45 @@ pub struct SrsConfig {
 
 fn default_admin() -> String {
     "admin".into()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PlaybackConfig {
+    #[serde(default = "default_playback_protocols")]
+    pub protocols: String,
+}
+
+impl PlaybackConfig {
+    pub fn protocols(&self) -> Vec<String> {
+        parse_playback_protocols(&self.protocols)
+    }
+}
+
+fn default_playback_config() -> PlaybackConfig {
+    PlaybackConfig {
+        protocols: default_playback_protocols(),
+    }
+}
+
+fn default_playback_protocols() -> String {
+    "webrtc,hls".into()
+}
+
+pub fn parse_playback_protocols(raw: &str) -> Vec<String> {
+    const SUPPORTED: &[&str] = &["webrtc", "hls", "flv"];
+    let mut protocols = Vec::new();
+
+    for protocol in raw.split(',').map(|p| p.trim().to_ascii_lowercase()) {
+        if SUPPORTED.contains(&protocol.as_str()) && !protocols.contains(&protocol) {
+            protocols.push(protocol);
+        }
+    }
+
+    if protocols.is_empty() {
+        parse_playback_protocols(&default_playback_protocols())
+    } else {
+        protocols
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -103,6 +144,7 @@ mod tests {
         "STREAM_API_SRS__API_USER",
         "STREAM_API_SRS__API_PASSWORD",
         "STREAM_API_SRS__CALLBACK_SECRET",
+        "STREAM_API_PLAYBACK__PROTOCOLS",
         "STREAM_API_METRICS__ENABLED",
     ];
 
@@ -141,6 +183,10 @@ mod tests {
         env::set_var("STREAM_API_SRS__API_USER", "srs-admin");
         env::set_var("STREAM_API_SRS__API_PASSWORD", "srs-password");
         env::set_var("STREAM_API_SRS__CALLBACK_SECRET", "callback-secret");
+        env::set_var(
+            "STREAM_API_PLAYBACK__PROTOCOLS",
+            "webrtc, flv, unknown, hls, flv",
+        );
         env::set_var("STREAM_API_METRICS__ENABLED", "false");
 
         let config = load_config("/private/tmp/moyulive-missing-config.toml")
@@ -157,6 +203,27 @@ mod tests {
         assert_eq!(config.srs.api_user, "srs-admin");
         assert_eq!(config.srs.api_password, "srs-password");
         assert_eq!(config.srs.callback_secret, "callback-secret");
+        assert_eq!(config.playback.protocols(), vec!["webrtc", "flv", "hls"]);
         assert!(!config.metrics.enabled);
+    }
+
+    #[test]
+    fn playback_protocols_default_to_conservative_supported_list() {
+        let _guard = with_clean_env();
+
+        env::set_var("STREAM_API_HTTP_PORT", "19081");
+        env::set_var(
+            "STREAM_API_DB__DSN",
+            "host=postgres user=yantube password=secret dbname=yantube port=5432 sslmode=disable",
+        );
+        env::set_var("STREAM_API_USER__AUTH_SECRET", "jwt-secret");
+        env::set_var("STREAM_API_SRS__API_URL", "http://srs:1985");
+        env::set_var("STREAM_API_SRS__CALLBACK_SECRET", "callback-secret");
+        env::set_var("STREAM_API_METRICS__ENABLED", "false");
+
+        let config = load_config("/private/tmp/moyulive-missing-config.toml")
+            .expect("config should load with default playback protocols");
+
+        assert_eq!(config.playback.protocols(), vec!["webrtc", "hls"]);
     }
 }

@@ -12,7 +12,7 @@ use axum::{
     http::{header, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use clap::Parser;
@@ -26,7 +26,6 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use crate::auth::JwtSecret;
 use crate::srs_client::SrsClient;
 
-#[derive(Clone)]
 pub struct AppState {
     pub db: DatabaseConnection,
     pub config: Arc<config::AppConfig>,
@@ -128,7 +127,17 @@ async fn main() {
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/api/account/create", post(handlers::account::create))
-        .route("/api/account/login", post(handlers::account::login));
+        .route("/api/account/login", post(handlers::account::login))
+        .route("/api/live/rooms", get(handlers::live::public_live_rooms))
+        .route("/feeds/live.xml", get(handlers::live_feed::live_rss_feed))
+        .route(
+            "/feeds/live/:stream_id",
+            get(handlers::live_feed::live_room_rss_feed),
+        )
+        .route(
+            "/api/playback/protocols",
+            get(handlers::playback::protocols),
+        );
 
     // SRS callback routes — protected by callback_secret middleware
     let srs_state = state.clone();
@@ -166,6 +175,10 @@ async fn main() {
         .route(
             "/api/live/stream/code/reset",
             post(handlers::live::reset_stream_code),
+        )
+        .route(
+            "/api/live/room/title",
+            put(handlers::live::update_room_title),
         )
         .route(
             "/api/live/stream/status",

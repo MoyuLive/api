@@ -1,13 +1,18 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use chrono::{Duration, NaiveDateTime};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::entities::{forward_rule, live_session, srs_server, user};
+use crate::entities::{forward_rule, live_session, live_stream_state, srs_server, user};
 use crate::AppState;
 
 // SRS callback body types
+
+const LIVE_RECONNECT_GRACE_SECONDS: i64 = 600;
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
@@ -126,6 +131,89 @@ fn parse_token_from_param(param: &str) -> Option<String> {
     None
 }
 
+fn next_episode_started_at(
+    previous: Option<&live_stream_state::Model>,
+    now: NaiveDateTime,
+) -> NaiveDateTime {
+    let Some(previous) = previous else {
+        return now;
+    };
+
+    if previous.status == "active" {
+        return previous.episode_started_at;
+    }
+
+    let Some(last_unpublished_at) = previous.last_unpublished_at else {
+        return now;
+    };
+
+    if now - last_unpublished_at <= Duration::seconds(LIVE_RECONNECT_GRACE_SECONDS) {
+        previous.episode_started_at
+    } else {
+        now
+    }
+}
+
+async fn mark_live_stream_published(
+    db: &DatabaseConnection,
+    stream_id: &str,
+    user_id: i32,
+    now: NaiveDateTime,
+) -> Result<(), DbErr> {
+    let previous = live_stream_state::Entity::find()
+        .filter(live_stream_state::Column::StreamId.eq(stream_id))
+        .one(db)
+        .await?;
+    let episode_started_at = next_episode_started_at(previous.as_ref(), now);
+
+    if let Some(previous) = previous {
+        let mut active: live_stream_state::ActiveModel = previous.into();
+        active.user_id = Set(user_id);
+        active.status = Set("active".to_string());
+        active.episode_started_at = Set(episode_started_at);
+        active.last_unpublished_at = Set(None);
+        active.updated_at = Set(now);
+        active.update(db).await?;
+        return Ok(());
+    }
+
+    let state = live_stream_state::ActiveModel {
+        stream_id: Set(stream_id.to_string()),
+        user_id: Set(user_id),
+        status: Set("active".to_string()),
+        episode_started_at: Set(episode_started_at),
+        last_unpublished_at: Set(None),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    state.insert(db).await?;
+    Ok(())
+}
+
+async fn mark_live_stream_unpublished(
+    db: &DatabaseConnection,
+    stream_id: &str,
+    now: NaiveDateTime,
+) -> Result<(), DbErr> {
+    live_stream_state::Entity::update_many()
+        .filter(live_stream_state::Column::StreamId.eq(stream_id))
+        .col_expr(
+            live_stream_state::Column::Status,
+            sea_orm::sea_query::Expr::value("ended"),
+        )
+        .col_expr(
+            live_stream_state::Column::LastUnpublishedAt,
+            sea_orm::sea_query::Expr::value(Some(now)),
+        )
+        .col_expr(
+            live_stream_state::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 // POST /api/internal/srs/on_publish
 pub async fn on_publish(
     State(state): State<Arc<AppState>>,
@@ -174,6 +262,21 @@ pub async fn on_publish(
         }
     };
 
+    if body.stream != user_model.username {
+        warn!(
+            stream = %body.stream,
+            username = %user_model.username,
+            "on_publish: stream does not belong to user, denying"
+        );
+        return (
+            StatusCode::OK,
+            Json(CallbackResponse {
+                code: 1,
+                data: None,
+            }),
+        );
+    }
+
     let stream_url = if body.tc_url.is_empty() {
         body.stream.clone()
     } else {
@@ -214,6 +317,10 @@ pub async fn on_publish(
     {
         error!("on_publish: failed to upsert live session: {}", e);
     }
+    if let Err(e) = mark_live_stream_published(&state.db, &body.stream, user_model.id, now).await {
+        error!("on_publish: failed to update live stream state: {}", e);
+    }
+
     let stream_key = format!("{}/{}", body.app, body.stream);
     let rules = match forward_rule::Entity::find()
         .filter(
@@ -284,6 +391,9 @@ pub async fn on_unpublish(
 
     if let Err(e) = result {
         error!("on_unpublish: failed to end live session: {}", e);
+    }
+    if let Err(e) = mark_live_stream_unpublished(&state.db, &body.stream, now).await {
+        error!("on_unpublish: failed to update live stream state: {}", e);
     }
 
     (
@@ -378,4 +488,180 @@ pub async fn heartbeat(
             data: None,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::to_bytes, response::IntoResponse};
+    use chrono::NaiveDateTime;
+    use sea_orm::{DbBackend, MockDatabase, MockExecResult};
+
+    use crate::config::{
+        AppConfig, DbConfig, MetricsConfig, PlaybackConfig, SrsConfig, UserConfig,
+    };
+    use crate::entities::live_stream_state;
+    use crate::srs_client::SrsClient;
+
+    fn test_state(db: sea_orm::DatabaseConnection) -> Arc<AppState> {
+        Arc::new(AppState {
+            db,
+            config: Arc::new(AppConfig {
+                http_port: 9081,
+                db: DbConfig {
+                    dsn: "mock".to_string(),
+                },
+                user: UserConfig {
+                    allow_register: false,
+                    auth_realm: "stream api".to_string(),
+                    auth_secret: "test-secret".to_string(),
+                },
+                srs: SrsConfig {
+                    api_url: "http://srs:1985".to_string(),
+                    api_user: "admin".to_string(),
+                    api_password: "password".to_string(),
+                    callback_secret: "callback-secret".to_string(),
+                },
+                playback: PlaybackConfig {
+                    protocols: "webrtc,hls".to_string(),
+                },
+                metrics: MetricsConfig { enabled: false },
+                cors_origins: vec!["http://localhost:5173".to_string()],
+            }),
+            srs_client: Arc::new(SrsClient::new(
+                "http://srs:1985".to_string(),
+                "admin".to_string(),
+                "password".to_string(),
+            )),
+        })
+    }
+
+    async fn callback_code(response: impl IntoResponse) -> i32 {
+        let response = response.into_response();
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("callback body should be readable");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("callback body should be json")
+            ["code"]
+            .as_i64()
+            .expect("callback code should be an integer") as i32
+    }
+
+    #[tokio::test]
+    async fn on_publish_rejects_valid_token_for_another_users_stream() {
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[user::Model {
+                id: 1,
+                username: "dawu".to_string(),
+                password: "hashed".to_string(),
+                stream_code: "valid-stream-code".to_string(),
+                room_title: String::new(),
+            }]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<forward_rule::Model>::new()])
+            .into_connection();
+
+        let code = callback_code(
+            on_publish(
+                State(test_state(db)),
+                Json(PublishBody {
+                    action: "on_publish".to_string(),
+                    app: "live".to_string(),
+                    stream: "ytb".to_string(),
+                    param: "?token=valid-stream-code".to_string(),
+                    tc_url: "rtmp://live.example.test/live".to_string(),
+                    vhost: "__defaultVhost__".to_string(),
+                    client_id: "client-1".to_string(),
+                    ip: "127.0.0.1".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn on_publish_allows_valid_token_for_own_stream() {
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[user::Model {
+                id: 1,
+                username: "dawu".to_string(),
+                password: "hashed".to_string(),
+                stream_code: "valid-stream-code".to_string(),
+                room_title: String::new(),
+            }]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<forward_rule::Model>::new()])
+            .into_connection();
+
+        let code = callback_code(
+            on_publish(
+                State(test_state(db)),
+                Json(PublishBody {
+                    action: "on_publish".to_string(),
+                    app: "live".to_string(),
+                    stream: "dawu".to_string(),
+                    param: "?token=valid-stream-code".to_string(),
+                    tc_url: "rtmp://live.example.test/live".to_string(),
+                    vhost: "__defaultVhost__".to_string(),
+                    client_id: "client-1".to_string(),
+                    ip: "127.0.0.1".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(code, 0);
+    }
+
+    fn live_state(
+        status: &str,
+        episode_started_at: &str,
+        last_unpublished_at: Option<&str>,
+    ) -> live_stream_state::Model {
+        live_stream_state::Model {
+            id: 1,
+            stream_id: "dawu".to_string(),
+            user_id: 1,
+            status: status.to_string(),
+            episode_started_at: NaiveDateTime::parse_from_str(episode_started_at, "%F %T")
+                .expect("valid episode timestamp"),
+            last_unpublished_at: last_unpublished_at.map(|value| {
+                NaiveDateTime::parse_from_str(value, "%F %T").expect("valid unpublished timestamp")
+            }),
+            updated_at: NaiveDateTime::parse_from_str(episode_started_at, "%F %T")
+                .expect("valid update timestamp"),
+        }
+    }
+
+    #[test]
+    fn reconnect_inside_grace_keeps_original_episode_start() {
+        let previous = live_state("ended", "2026-06-04 12:00:00", Some("2026-06-04 12:03:00"));
+        let now =
+            NaiveDateTime::parse_from_str("2026-06-04 12:08:00", "%F %T").expect("valid timestamp");
+
+        let started_at = next_episode_started_at(Some(&previous), now);
+
+        assert_eq!(started_at, previous.episode_started_at);
+    }
+
+    #[test]
+    fn reconnect_after_grace_starts_new_episode() {
+        let previous = live_state("ended", "2026-06-04 12:00:00", Some("2026-06-04 12:03:00"));
+        let now =
+            NaiveDateTime::parse_from_str("2026-06-04 12:20:00", "%F %T").expect("valid timestamp");
+
+        let started_at = next_episode_started_at(Some(&previous), now);
+
+        assert_eq!(started_at, now);
+    }
 }

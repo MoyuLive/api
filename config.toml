@@ -14,5 +14,8 @@ api_user = "admin"
 api_password = "admin"
 callback_secret = "secret"
 
+[playback]
+protocols = "webrtc,hls"
+
 [metrics]
 enabled = true

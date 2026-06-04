@@ -33,6 +33,17 @@ pub struct SrsStream {
     pub audio: Option<SrsStreamAudio>,
     #[serde(default)]
     pub video: Option<SrsStreamVideo>,
+    #[serde(default)]
+    pub publish: Option<SrsStreamPublish>,
+}
+
+impl SrsStream {
+    pub fn is_publishing(&self) -> bool {
+        self.publish
+            .as_ref()
+            .map(|publish| publish.active)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +57,7 @@ pub struct SrsStreamAudio {
     pub codec: String,
     pub profile: String,
     pub sample_rate: i32,
+    #[serde(alias = "channel")]
     pub channels: i32,
 }
 
@@ -59,8 +71,37 @@ pub struct SrsStreamVideo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SrsStreamPublish {
+    pub active: bool,
+    #[serde(default)]
+    pub cid: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SrsStreamsData {
     pub streams: Vec<SrsStream>,
+}
+
+#[derive(Deserialize)]
+struct SrsStreamsResponse {
+    code: i32,
+    #[serde(default)]
+    streams: Vec<SrsStream>,
+    data: Option<SrsStreamsData>,
+}
+
+fn parse_streams_response(body: &str) -> Result<Vec<SrsStream>, String> {
+    let resp: SrsStreamsResponse =
+        serde_json::from_str(body).map_err(|e| format!("parse error: {}", e))?;
+    if resp.code != 0 {
+        return Err(format!("SRS API error: code={}", resp.code));
+    }
+
+    if !resp.streams.is_empty() {
+        return Ok(resp.streams);
+    }
+
+    Ok(resp.data.map(|data| data.streams).unwrap_or_default())
 }
 
 impl SrsClient {
@@ -104,20 +145,27 @@ impl SrsClient {
     pub async fn list_streams(&self, start: i32, count: i32) -> Result<Vec<SrsStream>, String> {
         let path = format!("/api/v1/streams/?start={}&count={}", start, count);
         let body = self.do_request("GET", &path).await?;
+        parse_streams_response(&body)
+    }
 
-        #[derive(Deserialize)]
-        struct Wrapper {
-            code: i32,
-            data: Option<SrsStreamsData>,
+    pub async fn list_all_streams(&self) -> Result<Vec<SrsStream>, String> {
+        const PAGE_SIZE: i32 = 100;
+
+        let mut start = 0;
+        let mut all_streams = Vec::new();
+        loop {
+            let streams = self.list_streams(start, PAGE_SIZE).await?;
+            let stream_count = streams.len();
+            all_streams.extend(streams);
+
+            if stream_count < PAGE_SIZE as usize {
+                break;
+            }
+
+            start += PAGE_SIZE;
         }
 
-        let resp: Wrapper =
-            serde_json::from_str(&body).map_err(|e| format!("parse error: {}", e))?;
-        if resp.code != 0 {
-            return Err(format!("SRS API error: code={}", resp.code));
-        }
-
-        Ok(resp.data.map(|d| d.streams).unwrap_or_default())
+        Ok(all_streams)
     }
 
     pub async fn get_stream(&self, stream_id: &str) -> Result<Option<SrsStream>, String> {
@@ -152,5 +200,80 @@ impl SrsClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_top_level_streams_response_from_srs() {
+        let body = r#"{
+            "code": 0,
+            "streams": [{
+                "id": "vid-1",
+                "name": "ytb",
+                "vhost": "__defaultVhost__",
+                "app": "live",
+                "live_ms": 1780321583369,
+                "clients": 2,
+                "frames": 15220,
+                "send_bytes": 242278001,
+                "recv_bytes": 453287163,
+                "kbps": {"recv_30s": 14173, "send_30s": 0},
+                "publish": {"active": true, "cid": "qv616x10"},
+                "video": {
+                    "codec": "H264",
+                    "profile": "High",
+                    "level": "Other",
+                    "width": 1920,
+                    "height": 1080
+                },
+                "audio": {
+                    "codec": "AAC",
+                    "sample_rate": 44100,
+                    "channel": 2,
+                    "profile": "LC"
+                }
+            }]
+        }"#;
+
+        let streams = parse_streams_response(body).expect("SRS response should parse");
+
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].name, "ytb");
+        assert!(streams[0].is_publishing());
+        assert_eq!(
+            streams[0].audio.as_ref().map(|audio| audio.channels),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn parses_nested_data_streams_response() {
+        let body = r#"{
+            "code": 0,
+            "data": {
+                "streams": [{
+                    "id": "vid-1",
+                    "name": "ytb",
+                    "vhost": "__defaultVhost__",
+                    "app": "live",
+                    "live_ms": 3000,
+                    "clients": 1,
+                    "frames": 10,
+                    "send_bytes": 20,
+                    "recv_bytes": 30,
+                    "publish": {"active": false}
+                }]
+            }
+        }"#;
+
+        let streams = parse_streams_response(body).expect("SRS response should parse");
+
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].name, "ytb");
+        assert!(!streams[0].is_publishing());
     }
 }

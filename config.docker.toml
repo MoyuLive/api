@@ -23,5 +23,9 @@ api_password = "srs_admin_change_me"
 # Set via STREAM_API_SRS__CALLBACK_SECRET env var in production
 callback_secret = "srs-callback-secret-change-me"
 
+[playback]
+# Conservative default. Enable flv only on deployments with SRS http_remux.
+protocols = "webrtc,hls"
+
 [metrics]
 enabled = true
