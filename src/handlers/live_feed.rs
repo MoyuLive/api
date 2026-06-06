@@ -239,9 +239,9 @@ fn escape_xml(value: &str) -> String {
 fn live_room_title(room_title: &str, fallback: &str) -> String {
     let title = room_title.trim();
     if title.is_empty() {
-        fallback.to_string()
+        format!("{}的直播间", fallback)
     } else {
-        title.to_string()
+        format!("{} - {}", title, fallback)
     }
 }
 
@@ -320,7 +320,7 @@ mod tests {
         );
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "大雾的游戏时间");
+        assert_eq!(items[0].title, "大雾的游戏时间 - dawu");
         assert_eq!(items[0].link, "https://live.example.test/live/dawu");
         assert_eq!(items[0].guid, "moyulive:live:dawu:1780574400000");
     }
@@ -369,7 +369,22 @@ mod tests {
         );
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "大雾的游戏时间");
+        assert_eq!(items[0].title, "大雾的游戏时间 - dawu");
         assert_eq!(items[0].link, "https://live.example.test/live/dawu");
+    }
+
+    #[test]
+    fn feed_items_use_username_room_when_title_is_empty() {
+        let items = build_live_feed_items(
+            vec![live_state("dawu", "2026-06-04 12:00:00")],
+            vec![live_room_model(1, "dawu", "")],
+            timestamp("2026-06-04 12:01:00"),
+            "https://live.example.test",
+            None,
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "dawu的直播间");
+        assert_eq!(items[0].description, "dawu的直播间 正在直播");
     }
 }

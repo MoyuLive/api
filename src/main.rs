@@ -75,19 +75,41 @@ async fn jwt_auth_middleware(
     }
 }
 
-fn percent_decoded_eq(value: &str, expected: &str) -> bool {
-    percent_decode_str(value)
-        .decode_utf8()
-        .map(|decoded| decoded.as_ref() == expected)
-        .unwrap_or(false)
+fn callback_secret_value_matches(value: &str, secret: &str) -> bool {
+    if value == secret {
+        return true;
+    }
+
+    let mut current = value.to_string();
+    for _ in 0..2 {
+        let decoded = percent_decode_str(&current)
+            .decode_utf8_lossy()
+            .into_owned();
+        if decoded == secret {
+            return true;
+        }
+        if decoded == current {
+            return false;
+        }
+        current = decoded;
+    }
+
+    false
 }
 
 fn path_secret_segment_matches(path: &str, prefix: &str, secret: &str) -> bool {
     path.strip_prefix(prefix)
         .and_then(|rest| rest.split('/').next())
         .filter(|segment| !segment.is_empty())
-        .map(|segment| percent_decoded_eq(segment, secret))
+        .map(|segment| callback_secret_value_matches(segment, secret))
         .unwrap_or(false)
+}
+
+fn path_secret_segment_present(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|segment| !segment.is_empty())
+        .is_some()
 }
 
 // SRS callback secret validation middleware — protects internal SRS callback routes
@@ -103,7 +125,32 @@ async fn validate_callback_secret(
         return Ok(next.run(req).await);
     }
 
-    // Check X-SRS-Callback-Secret header first
+    if request_has_callback_secret(&req, secret) {
+        Ok(next.run(req).await)
+    } else {
+        let callback_debug = callback_secret_debug(&req);
+        tracing::warn!(
+            header_present = callback_debug.header_present,
+            path_present = callback_debug.path_present,
+            query_present = callback_debug.query_present,
+            query_value_len = callback_debug.query_value_len,
+            query_value_has_percent = callback_debug.query_value_has_percent,
+            "validate_callback_secret: secret mismatch or missing, returning 403"
+        );
+        Err(StatusCode::FORBIDDEN)
+    }
+}
+
+#[derive(Debug, Default)]
+struct CallbackSecretDebug {
+    header_present: bool,
+    path_present: bool,
+    query_present: bool,
+    query_value_len: usize,
+    query_value_has_percent: bool,
+}
+
+fn request_has_callback_secret(req: &Request<Body>, secret: &str) -> bool {
     let header_match = req
         .headers()
         .get("x-srs-callback-secret")
@@ -111,33 +158,66 @@ async fn validate_callback_secret(
         .map(|v| v == secret)
         .unwrap_or(false);
 
-    // Check query param callback_secret
     let query_match = req
         .uri()
         .query()
-        .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .any(|(key, value)| key == "callback_secret" && value.as_ref() == secret.as_str())
-        })
+        .map(|query| query_has_callback_secret(query, secret))
         .unwrap_or(false);
-
     let path = req.uri().path();
     let heartbeat_path_match =
         path_secret_segment_matches(path, "/api/internal/srs/heartbeat/", secret);
     let legacy_callback_path_match =
         path_secret_segment_matches(path, "/api/internal/srs/callback/", secret);
 
-    if header_match || query_match || heartbeat_path_match || legacy_callback_path_match {
-        Ok(next.run(req).await)
-    } else {
-        tracing::warn!(
-            path = %req.uri().path(),
-            has_query = req.uri().query().is_some(),
-            has_secret_header = req.headers().contains_key("x-srs-callback-secret"),
-            "validate_callback_secret: secret mismatch or missing, returning 403"
-        );
-        Err(StatusCode::FORBIDDEN)
+    header_match || query_match || heartbeat_path_match || legacy_callback_path_match
+}
+
+fn query_has_callback_secret(query: &str, secret: &str) -> bool {
+    query.split('&').any(|kv| {
+        let mut parts = kv.splitn(2, '=');
+        parts.next() == Some("callback_secret")
+            && parts
+                .next()
+                .map(|value| callback_secret_value_matches(value, secret))
+                .unwrap_or(false)
+    })
+}
+
+fn callback_secret_debug(req: &Request<Body>) -> CallbackSecretDebug {
+    let header_present = req.headers().contains_key("x-srs-callback-secret");
+    let path = req.uri().path();
+    let path_present = req
+        .uri()
+        .path()
+        .strip_prefix("/api/internal/srs/callback/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some()
+        || path_secret_segment_present(path, "/api/internal/srs/heartbeat/");
+    let Some(query) = req.uri().query() else {
+        return CallbackSecretDebug {
+            header_present,
+            path_present,
+            ..Default::default()
+        };
+    };
+
+    let mut debug = CallbackSecretDebug {
+        header_present,
+        path_present,
+        ..Default::default()
+    };
+    for kv in query.split('&') {
+        let mut parts = kv.splitn(2, '=');
+        if parts.next() == Some("callback_secret") {
+            if let Some(value) = parts.next() {
+                debug.query_present = true;
+                debug.query_value_len = value.len();
+                debug.query_value_has_percent = value.contains('%');
+            }
+            break;
+        }
     }
+    debug
 }
 
 #[tokio::main]
@@ -231,6 +311,10 @@ async fn main() {
         )
         .route(
             "/api/internal/srs/heartbeat/:callback_secret",
+            post(handlers::srs_callback::heartbeat),
+        )
+        .route(
+            "/api/internal/srs/callback/:callback_secret/heartbeat",
             post(handlers::srs_callback::heartbeat),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -384,11 +468,52 @@ mod tests {
     }
 
     #[test]
+    fn callback_secret_query_accepts_percent_encoded_value() {
+        assert!(query_has_callback_secret(
+            "callback_secret=abc%2B%2F%3D",
+            "abc+/="
+        ));
+    }
+
+    #[test]
     fn path_secret_segment_rejects_mismatched_secret() {
         assert!(!path_secret_segment_matches(
             "/api/internal/srs/callback/wrong/on_publish",
             "/api/internal/srs/callback/",
             "expected"
+        ));
+    }
+
+    #[test]
+    fn callback_secret_query_keeps_raw_value_compatibility() {
+        assert!(query_has_callback_secret(
+            "callback_secret=abc+/=",
+            "abc+/="
+        ));
+    }
+
+    #[test]
+    fn callback_secret_query_rejects_wrong_value() {
+        assert!(!query_has_callback_secret(
+            "callback_secret=abc%2B%2F%3D",
+            "wrong"
+        ));
+    }
+
+    #[test]
+    fn callback_secret_query_accepts_double_encoded_value() {
+        assert!(query_has_callback_secret(
+            "callback_secret=abc%252B%252F%253D",
+            "abc+/="
+        ));
+    }
+
+    #[test]
+    fn callback_secret_path_accepts_percent_encoded_value() {
+        assert!(path_secret_segment_matches(
+            "/api/internal/srs/callback/abc%2B%2F%3D/heartbeat",
+            "/api/internal/srs/callback/",
+            "abc+/="
         ));
     }
 }
