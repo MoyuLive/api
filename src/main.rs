@@ -16,6 +16,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use percent_encoding::percent_decode_str;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
@@ -74,6 +75,21 @@ async fn jwt_auth_middleware(
     }
 }
 
+fn percent_decoded_eq(value: &str, expected: &str) -> bool {
+    percent_decode_str(value)
+        .decode_utf8()
+        .map(|decoded| decoded.as_ref() == expected)
+        .unwrap_or(false)
+}
+
+fn path_secret_segment_matches(path: &str, prefix: &str, secret: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| percent_decoded_eq(segment, secret))
+        .unwrap_or(false)
+}
+
 // SRS callback secret validation middleware — protects internal SRS callback routes
 async fn validate_callback_secret(
     State(state): State<Arc<AppState>>,
@@ -105,14 +121,13 @@ async fn validate_callback_secret(
         })
         .unwrap_or(false);
 
-    let heartbeat_path_match = req
-        .uri()
-        .path()
-        .strip_prefix("/api/internal/srs/heartbeat/")
-        .map(|value| value.trim_end_matches('/') == secret)
-        .unwrap_or(false);
+    let path = req.uri().path();
+    let heartbeat_path_match =
+        path_secret_segment_matches(path, "/api/internal/srs/heartbeat/", secret);
+    let legacy_callback_path_match =
+        path_secret_segment_matches(path, "/api/internal/srs/callback/", secret);
 
-    if header_match || query_match || heartbeat_path_match {
+    if header_match || query_match || heartbeat_path_match || legacy_callback_path_match {
         Ok(next.run(req).await)
     } else {
         tracing::warn!(
@@ -175,7 +190,15 @@ async fn main() {
             post(handlers::srs_callback::on_publish),
         )
         .route(
+            "/api/internal/srs/callback/:callback_secret/on_publish",
+            post(handlers::srs_callback::on_publish),
+        )
+        .route(
             "/api/internal/srs/on_forward",
+            post(handlers::srs_callback::on_forward),
+        )
+        .route(
+            "/api/internal/srs/callback/:callback_secret/on_forward",
             post(handlers::srs_callback::on_forward),
         )
         .route(
@@ -183,11 +206,23 @@ async fn main() {
             post(handlers::srs_callback::on_unpublish),
         )
         .route(
+            "/api/internal/srs/callback/:callback_secret/on_unpublish",
+            post(handlers::srs_callback::on_unpublish),
+        )
+        .route(
             "/api/internal/srs/on_play",
             post(handlers::srs_callback::on_play),
         )
         .route(
+            "/api/internal/srs/callback/:callback_secret/on_play",
+            post(handlers::srs_callback::on_play),
+        )
+        .route(
             "/api/internal/srs/on_stop",
+            post(handlers::srs_callback::on_stop),
+        )
+        .route(
+            "/api/internal/srs/callback/:callback_secret/on_stop",
             post(handlers::srs_callback::on_stop),
         )
         .route(
@@ -330,4 +365,30 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install Ctrl+C handler");
     info!("Shutting down gracefully...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_secret_segment_matches_legacy_encoded_callback_secret() {
+        let secret = "fZ5VZDQjViJttQSgGwHyiqWpVo8XN0la8LUO+Ibcz/w=";
+        let path = "/api/internal/srs/callback/fZ5VZDQjViJttQSgGwHyiqWpVo8XN0la8LUO%2BIbcz%2Fw%3D/on_publish";
+
+        assert!(path_secret_segment_matches(
+            path,
+            "/api/internal/srs/callback/",
+            secret
+        ));
+    }
+
+    #[test]
+    fn path_secret_segment_rejects_mismatched_secret() {
+        assert!(!path_secret_segment_matches(
+            "/api/internal/srs/callback/wrong/on_publish",
+            "/api/internal/srs/callback/",
+            "expected"
+        ));
+    }
 }
