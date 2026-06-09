@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::error;
 
+use crate::auth::CurrentUser;
 use crate::entities::srs_server;
 use crate::response::{error_response, success_response};
 use crate::AppState;
@@ -19,7 +20,14 @@ pub struct ServerStatusResp {
 }
 
 // GET /api/system/status
-pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn status(
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+) -> impl IntoResponse {
+    if !auth_user.is_admin() {
+        return (StatusCode::FORBIDDEN, error_response(403, "admin required"));
+    }
+
     let servers = srs_server::Entity::find()
         .filter(srs_server::Column::IsActive.eq(true))
         .order_by_desc(srs_server::Column::LastHeartbeat)

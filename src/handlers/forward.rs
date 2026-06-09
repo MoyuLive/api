@@ -13,12 +13,17 @@ use std::sync::Arc;
 use tracing::{error, info};
 use url::Url;
 
+use crate::auth::CurrentUser;
 use crate::entities::forward_rule;
 use crate::response::{error_response, success_response};
 use crate::AppState;
 
 // GET /api/live/forward/rules
-pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list(State(state): State<Arc<AppState>>, auth_user: CurrentUser) -> impl IntoResponse {
+    if !auth_user.is_admin() {
+        return (StatusCode::FORBIDDEN, error_response(403, "admin required"));
+    }
+
     let rules = forward_rule::Entity::find()
         .order_by_asc(forward_rule::Column::Id)
         .all(&state.db)
@@ -163,8 +168,13 @@ async fn rule_exists(
 // POST /api/live/forward/rules
 pub async fn add(
     State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
     Json(req): Json<AddForwardRuleRequest>,
 ) -> impl IntoResponse {
+    if !auth_user.is_admin() {
+        return (StatusCode::FORBIDDEN, error_response(403, "admin required"));
+    }
+
     let stream_filter = match normalize_stream_filter(&req.stream_filter) {
         Ok(filter) => filter,
         Err(msg) => return (StatusCode::BAD_REQUEST, error_response(400, msg)),
@@ -220,9 +230,14 @@ pub async fn add(
 // PUT /api/live/forward/rules/:id
 pub async fn update(
     State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
     Path(id): Path<i32>,
     Json(req): Json<UpdateForwardRuleRequest>,
 ) -> impl IntoResponse {
+    if !auth_user.is_admin() {
+        return (StatusCode::FORBIDDEN, error_response(403, "admin required"));
+    }
+
     let Some(existing) = (match forward_rule::Entity::find_by_id(id).one(&state.db).await {
         Ok(rule) => rule,
         Err(e) => {
@@ -292,7 +307,15 @@ pub async fn update(
 }
 
 // DELETE /api/live/forward/rules/:id
-pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<i32>) -> impl IntoResponse {
+pub async fn delete(
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+    Path(id): Path<i32>,
+) -> impl IntoResponse {
+    if !auth_user.is_admin() {
+        return (StatusCode::FORBIDDEN, error_response(403, "admin required"));
+    }
+
     let result = forward_rule::Entity::delete_by_id(id).exec(&state.db).await;
 
     match result {

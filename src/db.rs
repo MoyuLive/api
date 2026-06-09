@@ -9,6 +9,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/04_create_forward_rules.sql"),
     include_str!("../migrations/05_add_user_room_title.sql"),
     include_str!("../migrations/06_create_live_stream_states.sql"),
+    include_str!("../migrations/07_create_platform_admin_and_live_rooms.sql"),
 ];
 
 pub async fn init_db(dsn: &str) -> DatabaseConnection {

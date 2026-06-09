@@ -5,13 +5,16 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    Set,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tracing::{error, info};
 
 use crate::auth::{generate_random_string, CurrentUser};
-use crate::entities::{live_session, user};
+use crate::entities::{live_room, live_session};
 use crate::response::{error_response, success_response};
 use crate::srs_client::SrsStream;
 use crate::AppState;
@@ -32,28 +35,45 @@ pub struct PublicLiveRoom {
     pub send_kbps: Option<i32>,
 }
 
+async fn default_live_room(
+    db: &DatabaseConnection,
+    auth_user: &CurrentUser,
+) -> Result<Option<live_room::Model>, DbErr> {
+    let username_room = live_room::Entity::find()
+        .filter(live_room::Column::UserId.eq(auth_user.user_id))
+        .filter(live_room::Column::StreamId.eq(&auth_user.username))
+        .one(db)
+        .await?;
+
+    if username_room.is_some() {
+        return Ok(username_room);
+    }
+
+    live_room::Entity::find()
+        .filter(live_room::Column::UserId.eq(auth_user.user_id))
+        .order_by_asc(live_room::Column::Id)
+        .one(db)
+        .await
+}
+
 // GET /api/live/stream/code
 pub async fn stream_code(
     State(state): State<Arc<AppState>>,
     auth_user: CurrentUser,
 ) -> impl IntoResponse {
-    let user = match user::Entity::find()
-        .filter(user::Column::Username.eq(&auth_user.username))
-        .one(&state.db)
-        .await
-    {
-        Ok(Some(u)) => u,
+    let room = match default_live_room(&state.db, &auth_user).await {
+        Ok(Some(room)) => room,
         Ok(None) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                error_response(500, "authenticated user not found in database"),
+                error_response(500, "default live room not found"),
             );
         }
         Err(e) => {
-            error!("Failed to get user: {}", e);
+            error!("Failed to get default live room: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                error_response(500, "failed to get user"),
+                error_response(500, "failed to get live room"),
             );
         }
     };
@@ -61,10 +81,10 @@ pub async fn stream_code(
     (
         StatusCode::OK,
         success_response(serde_json::json!({
-            "stream_code": user.stream_code,
-            "stream_id": user.username,
-            "username": user.username,
-            "title": user.room_title,
+            "stream_code": room.stream_code,
+            "stream_id": room.stream_id,
+            "username": auth_user.username,
+            "title": room.title,
         })),
     )
 }
@@ -75,25 +95,41 @@ pub async fn reset_stream_code(
     auth_user: CurrentUser,
 ) -> impl IntoResponse {
     let new_code = generate_random_string(16);
+    let room = match default_live_room(&state.db, &auth_user).await {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "default live room not found"),
+            );
+        }
+        Err(e) => {
+            error!("Failed to get default live room: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to get live room"),
+            );
+        }
+    };
 
-    let result = user::Entity::update_many()
-        .filter(user::Column::Username.eq(&auth_user.username))
-        .col_expr(
-            user::Column::StreamCode,
-            sea_orm::sea_query::Expr::value(new_code.clone()),
-        )
-        .exec(&state.db)
-        .await;
+    let mut active: live_room::ActiveModel = room.clone().into();
+    active.stream_code = Set(new_code.clone());
+    active.updated_at = Set(Utc::now().naive_utc());
+    let result = active.update(&state.db).await;
 
     match result {
-        Ok(_) => (
-            StatusCode::OK,
-            success_response(serde_json::json!({
-                "stream_code": new_code,
-                "stream_id": auth_user.username,
-                "username": auth_user.username,
-            })),
-        ),
+        Ok(updated_room) => {
+            sync_legacy_user_room_fields(&state.db, &auth_user, &updated_room).await;
+            (
+                StatusCode::OK,
+                success_response(serde_json::json!({
+                    "stream_code": new_code,
+                    "stream_id": updated_room.stream_id,
+                    "username": auth_user.username,
+                    "title": updated_room.title,
+                })),
+            )
+        }
         Err(e) => {
             error!("Failed to reset stream code: {}", e);
             (
@@ -122,24 +158,40 @@ pub async fn update_room_title(
         }
     };
 
-    let result = user::Entity::update_many()
-        .filter(user::Column::Id.eq(auth_user.user_id))
-        .col_expr(
-            user::Column::RoomTitle,
-            sea_orm::sea_query::Expr::value(title.clone()),
-        )
-        .exec(&state.db)
-        .await;
+    let room = match default_live_room(&state.db, &auth_user).await {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "default live room not found"),
+            );
+        }
+        Err(e) => {
+            error!("Failed to get default live room: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to get live room"),
+            );
+        }
+    };
+
+    let mut active: live_room::ActiveModel = room.into();
+    active.title = Set(title.clone());
+    active.updated_at = Set(Utc::now().naive_utc());
+    let result = active.update(&state.db).await;
 
     match result {
-        Ok(_) => (
-            StatusCode::OK,
-            success_response(serde_json::json!({
-                "stream_id": auth_user.username,
-                "username": auth_user.username,
-                "title": title,
-            })),
-        ),
+        Ok(updated_room) => {
+            sync_legacy_user_room_fields(&state.db, &auth_user, &updated_room).await;
+            (
+                StatusCode::OK,
+                success_response(serde_json::json!({
+                    "stream_id": updated_room.stream_id,
+                    "username": auth_user.username,
+                    "title": title,
+                })),
+            )
+        }
         Err(e) => {
             error!("Failed to update room title: {}", e);
             (
@@ -147,6 +199,33 @@ pub async fn update_room_title(
                 error_response(500, "failed to update room title"),
             )
         }
+    }
+}
+
+async fn sync_legacy_user_room_fields(
+    db: &DatabaseConnection,
+    auth_user: &CurrentUser,
+    room: &live_room::Model,
+) {
+    if room.stream_id != auth_user.username {
+        return;
+    }
+
+    let result = crate::entities::user::Entity::update_many()
+        .filter(crate::entities::user::Column::Id.eq(auth_user.user_id))
+        .col_expr(
+            crate::entities::user::Column::StreamCode,
+            sea_orm::sea_query::Expr::value(room.stream_code.clone()),
+        )
+        .col_expr(
+            crate::entities::user::Column::RoomTitle,
+            sea_orm::sea_query::Expr::value(room.title.clone()),
+        )
+        .exec(db)
+        .await;
+
+    if let Err(e) = result {
+        error!("Failed to sync legacy user room fields: {}", e);
     }
 }
 
@@ -220,7 +299,7 @@ pub async fn stop_stream(
     match session {
         Ok(Some(s)) => {
             // Verify stream ownership
-            if s.user_id != auth_user.user_id {
+            if !auth_user.is_admin() && s.user_id != auth_user.user_id {
                 return (
                     StatusCode::FORBIDDEN,
                     error_response(403, "you can only stop your own streams"),
@@ -254,7 +333,34 @@ pub async fn stop_stream(
             }
         }
         Ok(None) => {
-            // Try kicking via stream name as fallback
+            match live_room::Entity::find()
+                .filter(live_room::Column::StreamId.eq(&req.stream_id))
+                .one(&state.db)
+                .await
+            {
+                Ok(Some(room)) if auth_user.is_admin() || room.user_id == auth_user.user_id => {}
+                Ok(Some(_)) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        error_response(403, "you can only stop your own streams"),
+                    );
+                }
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        error_response(404, "live room not found"),
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to get live room: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_response(500, "failed to get live room"),
+                    );
+                }
+            }
+
+            // Try kicking via stream name as fallback after authorization.
             match state.srs_client.kick_client(&req.stream_id).await {
                 Ok(_) => (
                     StatusCode::OK,
@@ -283,7 +389,14 @@ pub async fn stop_stream(
 }
 
 // GET /api/live/stream/list
-pub async fn stream_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn stream_list(
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+) -> impl IntoResponse {
+    if !auth_user.is_admin() {
+        return (StatusCode::FORBIDDEN, error_response(403, "admin required"));
+    }
+
     let sessions = live_session::Entity::find()
         .filter(live_session::Column::Status.eq("active"))
         .all(&state.db)
@@ -336,49 +449,54 @@ pub async fn public_live_rooms(State(state): State<Arc<AppState>>) -> impl IntoR
         }
     };
 
-    let user_ids: Vec<i32> = sessions.iter().map(|session| session.user_id).collect();
-    let users = if user_ids.is_empty() {
+    let room_ids: Vec<String> = sessions
+        .iter()
+        .map(|session| session.stream_id.clone())
+        .collect();
+    let rooms = if room_ids.is_empty() {
         Vec::new()
     } else {
-        match user::Entity::find()
-            .filter(user::Column::Id.is_in(user_ids))
+        match live_room::Entity::find()
+            .filter(live_room::Column::StreamId.is_in(room_ids))
             .all(&state.db)
             .await
         {
-            Ok(users) => users,
+            Ok(rooms) => rooms,
             Err(e) => {
-                error!("Failed to load live room user metadata: {}", e);
+                error!("Failed to load live room metadata: {}", e);
                 Vec::new()
             }
         }
     };
 
-    let rooms = build_public_live_rooms(streams, sessions, users);
+    let rooms = build_public_live_rooms(streams, sessions, rooms);
     (StatusCode::OK, success_response(rooms))
 }
 
 fn build_public_live_rooms(
     streams: Vec<SrsStream>,
     sessions: Vec<live_session::Model>,
-    users: Vec<user::Model>,
+    rooms: Vec<live_room::Model>,
 ) -> Vec<PublicLiveRoom> {
     let sessions_by_stream_id: HashMap<String, live_session::Model> = sessions
         .into_iter()
         .map(|session| (session.stream_id.clone(), session))
         .collect();
-    let users_by_id: HashMap<i32, user::Model> =
-        users.into_iter().map(|user| (user.id, user)).collect();
+    let rooms_by_stream_id: HashMap<String, live_room::Model> = rooms
+        .into_iter()
+        .map(|room| (room.stream_id.clone(), room))
+        .collect();
 
     let mut rooms: Vec<PublicLiveRoom> = streams
         .into_iter()
         .filter(SrsStream::is_publishing)
         .map(|stream| {
             let session = sessions_by_stream_id.get(&stream.name);
-            let user = session.and_then(|session| users_by_id.get(&session.user_id));
+            let room = rooms_by_stream_id.get(&stream.name);
             let started_at = session.map(|session| session.started_at);
             PublicLiveRoom {
-                title: user
-                    .map(|user| public_room_title(&user.room_title, &stream.name))
+                title: room
+                    .map(|room| public_room_title(&room.title, &stream.name))
                     .unwrap_or_else(|| stream.name.clone()),
                 stream_id: stream.name,
                 app: stream.app,
@@ -407,7 +525,7 @@ fn build_public_live_rooms(
     rooms
 }
 
-fn normalize_room_title(title: &str) -> Result<String, &'static str> {
+pub(crate) fn normalize_room_title(title: &str) -> Result<String, &'static str> {
     let title = title.trim();
     if title.chars().count() > MAX_ROOM_TITLE_CHARS {
         return Err("room title is too long");
@@ -478,13 +596,25 @@ mod tests {
         }
     }
 
-    fn user_model(id: i32, username: &str, room_title: &str) -> user::Model {
-        user::Model {
-            id,
-            username: username.to_string(),
-            password: "hashed-password".to_string(),
+    fn live_room_model(stream_id: &str, title: &str) -> live_room::Model {
+        let now =
+            NaiveDateTime::parse_from_str("2026-06-01 00:00:00", "%F %T").expect("valid timestamp");
+        live_room::Model {
+            id: 1,
+            user_id: 1,
+            stream_id: stream_id.to_string(),
+            title: title.to_string(),
             stream_code: "stream-code".to_string(),
-            room_title: room_title.to_string(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn live_room_model_with_id(id: i32, stream_id: &str, title: &str) -> live_room::Model {
+        live_room::Model {
+            id,
+            ..live_room_model(stream_id, title)
         }
     }
 
@@ -542,7 +672,7 @@ mod tests {
                 live_session("inactive-source", started_at),
                 live_session("offline-but-active-in-db", started_at),
             ],
-            vec![user_model(1, "dawu", "大雾的游戏时间")],
+            vec![live_room_model("dawu", "大雾的游戏时间")],
         );
 
         assert_eq!(rooms.len(), 1);
@@ -570,8 +700,8 @@ mod tests {
             ],
             vec![live_session("old", old), live_session("new", new)],
             vec![
-                user_model(1, "old", "旧直播间"),
-                user_model(1, "new", "新直播间"),
+                live_room_model_with_id(1, "old", "旧直播间"),
+                live_room_model_with_id(2, "new", "新直播间"),
             ],
         );
 
@@ -586,7 +716,7 @@ mod tests {
         let rooms = build_public_live_rooms(
             vec![srs_stream("dawu", 60_000)],
             vec![live_session("dawu", started_at)],
-            vec![user_model(1, "dawu", "   ")],
+            vec![live_room_model("dawu", "   ")],
         );
 
         assert_eq!(rooms[0].title, "dawu");

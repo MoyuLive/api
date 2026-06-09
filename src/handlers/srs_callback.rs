@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use url::form_urlencoded;
 
-use crate::entities::{forward_rule, live_session, live_stream_state, srs_server, user};
+use crate::entities::{forward_rule, live_room, live_session, live_stream_state, srs_server, user};
 use crate::AppState;
 
 // SRS callback body types
@@ -128,8 +128,12 @@ pub struct HeartbeatBody {
     pub mem_usage: f64,
     #[serde(default)]
     pub uptime_seconds: i64,
-    #[serde(default)]
+    #[serde(default = "default_active")]
     pub is_active: bool,
+}
+
+fn default_active() -> bool {
+    true
 }
 
 #[derive(serde::Serialize)]
@@ -334,15 +338,21 @@ pub async fn on_publish(
         }
     };
 
-    // Validate stream_code by finding the user
-    let user_model = match user::Entity::find()
-        .filter(user::Column::StreamCode.eq(&stream_code))
+    // Validate stream_code against the addressed live room.
+    let room_model = match live_room::Entity::find()
+        .filter(live_room::Column::StreamId.eq(&body.stream))
+        .filter(live_room::Column::StreamCode.eq(&stream_code))
+        .filter(live_room::Column::Enabled.eq(true))
         .one(&state.db)
         .await
     {
-        Ok(Some(u)) => u,
+        Ok(Some(room)) => room,
         Ok(None) => {
-            warn!(stream_code = %stream_code, "on_publish: invalid stream_code, denying");
+            warn!(
+                stream = %body.stream,
+                stream_code = %stream_code,
+                "on_publish: invalid stream_code or disabled room, denying"
+            );
             return (
                 StatusCode::OK,
                 Json(CallbackResponse {
@@ -363,20 +373,36 @@ pub async fn on_publish(
         }
     };
 
-    if body.stream != user_model.username {
-        warn!(
-            stream = %body.stream,
-            username = %user_model.username,
-            "on_publish: stream does not belong to user, denying"
-        );
-        return (
-            StatusCode::OK,
-            Json(CallbackResponse {
-                code: 1,
-                data: None,
-            }),
-        );
-    }
+    let user_model = match user::Entity::find_by_id(room_model.user_id)
+        .one(&state.db)
+        .await
+    {
+        Ok(Some(user)) if user.enabled => user,
+        Ok(Some(_)) | Ok(None) => {
+            warn!(
+                stream = %body.stream,
+                user_id = room_model.user_id,
+                "on_publish: room owner missing or disabled, denying"
+            );
+            return (
+                StatusCode::OK,
+                Json(CallbackResponse {
+                    code: 1,
+                    data: None,
+                }),
+            );
+        }
+        Err(e) => {
+            error!("on_publish: failed to load room owner: {}", e);
+            return (
+                StatusCode::OK,
+                Json(CallbackResponse {
+                    code: 1,
+                    data: None,
+                }),
+            );
+        }
+    };
 
     let stream_url = if body.tc_url.is_empty() {
         body.stream.clone()
@@ -425,6 +451,7 @@ pub async fn on_publish(
     info!(
         stream = %body.stream,
         user_id = user_model.id,
+        room_id = room_model.id,
         "on_publish: stream allowed"
     );
 
@@ -653,16 +680,37 @@ mod tests {
             .expect("callback code should be an integer") as i32
     }
 
+    fn room_model(stream_id: &str, stream_code: &str) -> live_room::Model {
+        let now =
+            NaiveDateTime::parse_from_str("2026-06-04 00:00:00", "%F %T").expect("valid time");
+        live_room::Model {
+            id: 1,
+            user_id: 1,
+            stream_id: stream_id.to_string(),
+            title: String::new(),
+            stream_code: stream_code.to_string(),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn user_model() -> user::Model {
+        user::Model {
+            id: 1,
+            username: "dawu".to_string(),
+            password: "hashed".to_string(),
+            stream_code: "valid-stream-code".to_string(),
+            room_title: String::new(),
+            role: crate::auth::ROLE_USER.to_string(),
+            enabled: true,
+        }
+    }
+
     #[tokio::test]
     async fn on_publish_rejects_valid_token_for_another_users_stream() {
         let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([[user::Model {
-                id: 1,
-                username: "dawu".to_string(),
-                password: "hashed".to_string(),
-                stream_code: "valid-stream-code".to_string(),
-                room_title: String::new(),
-            }]])
+            .append_query_results([Vec::<live_room::Model>::new()])
             .into_connection();
 
         let code = callback_code(
@@ -704,16 +752,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn heartbeat_defaults_to_active_when_field_is_missing() {
+        let body: HeartbeatBody = serde_json::from_str(
+            r#"{"device_id":"srs-1","ip":"127.0.0.1","cpu_usage":1.0,"mem_usage":2.0}"#,
+        )
+        .expect("heartbeat body should deserialize");
+
+        assert!(body.is_active);
+    }
+
     #[tokio::test]
     async fn on_publish_allows_valid_token_for_own_stream() {
         let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([[user::Model {
-                id: 1,
-                username: "dawu".to_string(),
-                password: "hashed".to_string(),
-                stream_code: "valid-stream-code".to_string(),
-                room_title: String::new(),
-            }]])
+            .append_query_results([[room_model("dawu", "valid-stream-code")]])
+            .append_query_results([[user_model()]])
             .append_exec_results([
                 MockExecResult {
                     last_insert_id: 1,

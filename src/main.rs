@@ -16,7 +16,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use sea_orm::DatabaseConnection;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -24,6 +24,7 @@ use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::auth::JwtSecret;
+use crate::entities::user;
 use crate::srs_client::SrsClient;
 
 pub struct AppState {
@@ -47,8 +48,26 @@ async fn jwt_auth_middleware(
     let (mut parts, body) = req.into_parts();
 
     match crate::auth::CurrentUser::from_request_parts(&mut parts, &state).await {
-        Ok(user) => {
-            parts.extensions.insert(user);
+        Ok(token_user) => {
+            let db_user = user::Entity::find()
+                .filter(user::Column::Id.eq(token_user.user_id))
+                .one(&state.db)
+                .await
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+            let Some(db_user) = db_user else {
+                return Err(StatusCode::UNAUTHORIZED);
+            };
+
+            if !db_user.enabled {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+
+            parts.extensions.insert(crate::auth::CurrentUser {
+                username: db_user.username,
+                user_id: db_user.id,
+                role: db_user.role,
+            });
             let req = Request::from_parts(parts, body);
             Ok(next.run(req).await)
         }
@@ -189,6 +208,31 @@ async fn main() {
     let protected_routes = Router::new()
         .route("/api/account/refresh", get(handlers::account::refresh))
         .route("/api/account/logout", post(handlers::account::logout))
+        .route("/api/admin/me", get(handlers::admin::me))
+        .route(
+            "/api/admin/users",
+            get(handlers::admin::list_users).post(handlers::admin::create_user),
+        )
+        .route(
+            "/api/admin/users/:id",
+            put(handlers::admin::update_user).delete(handlers::admin::delete_user),
+        )
+        .route(
+            "/api/admin/rooms",
+            get(handlers::admin::list_rooms).post(handlers::admin::create_room),
+        )
+        .route(
+            "/api/admin/rooms/:id",
+            put(handlers::admin::update_room).delete(handlers::admin::delete_room),
+        )
+        .route(
+            "/api/admin/rooms/:id/stream-code/reset",
+            post(handlers::admin::reset_room_stream_code),
+        )
+        .route(
+            "/api/admin/streams/:stream_id/stop",
+            post(handlers::admin::stop_stream),
+        )
         .route("/api/live/stream/code", get(handlers::live::stream_code))
         .route(
             "/api/live/stream/code/reset",

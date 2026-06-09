@@ -1,4 +1,5 @@
 pub mod account;
+pub mod admin;
 pub mod forward;
 pub mod live;
 pub mod live_feed;

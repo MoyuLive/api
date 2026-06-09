@@ -13,6 +13,10 @@ use subtle::ConstantTimeEq;
 
 const JWT_EXPIRATION_HOURS: i64 = 1;
 
+pub const ROLE_USER: &str = "user";
+pub const ROLE_ADMIN: &str = "admin";
+pub const ROLE_SUPER_ADMIN: &str = "super_admin";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub username: String,
@@ -29,6 +33,25 @@ pub struct CurrentUser {
     pub role: String,
 }
 
+impl CurrentUser {
+    pub fn is_admin(&self) -> bool {
+        matches!(self.role.as_str(), ROLE_ADMIN | ROLE_SUPER_ADMIN)
+    }
+
+    pub fn is_super_admin(&self) -> bool {
+        self.role == ROLE_SUPER_ADMIN
+    }
+}
+
+pub fn normalize_role(role: &str) -> Option<&'static str> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        ROLE_USER => Some(ROLE_USER),
+        ROLE_ADMIN => Some(ROLE_ADMIN),
+        ROLE_SUPER_ADMIN => Some(ROLE_SUPER_ADMIN),
+        _ => None,
+    }
+}
+
 #[axum::async_trait]
 impl<S> FromRequestParts<S> for CurrentUser
 where
@@ -37,6 +60,10 @@ where
     type Rejection = (StatusCode, Json<serde_json::Value>);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(user) = parts.extensions.get::<CurrentUser>() {
+            return Ok(user.clone());
+        }
+
         let auth_header = parts
             .headers
             .get("Authorization")

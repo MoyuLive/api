@@ -9,7 +9,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::{collections::HashMap, sync::Arc};
 use tracing::error;
 
-use crate::entities::{live_stream_state, user};
+use crate::entities::{live_room, live_stream_state};
 use crate::AppState;
 
 const LIVE_FEED_MIN_LIVE_SECONDS: i64 = 60;
@@ -61,18 +61,18 @@ async fn live_feed_response(
         }
     };
 
-    let user_ids: Vec<i32> = states.iter().map(|state| state.user_id).collect();
-    let users = if user_ids.is_empty() {
+    let stream_ids: Vec<String> = states.iter().map(|state| state.stream_id.clone()).collect();
+    let rooms = if stream_ids.is_empty() {
         Vec::new()
     } else {
-        match user::Entity::find()
-            .filter(user::Column::Id.is_in(user_ids))
+        match live_room::Entity::find()
+            .filter(live_room::Column::StreamId.is_in(stream_ids))
             .all(&state.db)
             .await
         {
-            Ok(users) => users,
+            Ok(rooms) => rooms,
             Err(e) => {
-                error!("Failed to load live feed users: {}", e);
+                error!("Failed to load live feed room metadata: {}", e);
                 Vec::new()
             }
         }
@@ -80,7 +80,7 @@ async fn live_feed_response(
 
     let now = Utc::now().naive_utc();
     let base_url = request_base_url(&headers);
-    let items = build_live_feed_items(states, users, now, &base_url, stream_id.as_deref());
+    let items = build_live_feed_items(states, rooms, now, &base_url, stream_id.as_deref());
     let xml = build_live_rss_xml(&items, now, &base_url, stream_id.as_deref());
 
     (
@@ -95,13 +95,15 @@ async fn live_feed_response(
 
 fn build_live_feed_items(
     states: Vec<live_stream_state::Model>,
-    users: Vec<user::Model>,
+    rooms: Vec<live_room::Model>,
     now: NaiveDateTime,
     base_url: &str,
     stream_filter: Option<&str>,
 ) -> Vec<LiveFeedItem> {
-    let users_by_id: HashMap<i32, user::Model> =
-        users.into_iter().map(|user| (user.id, user)).collect();
+    let rooms_by_stream_id: HashMap<String, live_room::Model> = rooms
+        .into_iter()
+        .map(|room| (room.stream_id.clone(), room))
+        .collect();
     let mut items: Vec<LiveFeedItem> = states
         .into_iter()
         .filter(|state| state.status == "active")
@@ -112,9 +114,9 @@ fn build_live_feed_items(
         })
         .filter(|state| (now - state.updated_at).num_seconds() >= LIVE_FEED_MIN_LIVE_SECONDS)
         .map(|state| {
-            let title = users_by_id
-                .get(&state.user_id)
-                .map(|user| live_room_title(&user.room_title, &state.stream_id))
+            let title = rooms_by_stream_id
+                .get(&state.stream_id)
+                .map(|room| live_room_title(&room.title, &state.stream_id))
                 .unwrap_or_else(|| state.stream_id.clone());
             let encoded_stream_id =
                 utf8_percent_encode(&state.stream_id, NON_ALPHANUMERIC).to_string();
@@ -280,13 +282,16 @@ mod tests {
         }
     }
 
-    fn user_model(id: i32, username: &str, room_title: &str) -> user::Model {
-        user::Model {
+    fn live_room_model(id: i32, stream_id: &str, title: &str) -> live_room::Model {
+        live_room::Model {
             id,
-            username: username.to_string(),
-            password: "hashed-password".to_string(),
+            user_id: id,
+            stream_id: stream_id.to_string(),
+            title: title.to_string(),
             stream_code: "stream-code".to_string(),
-            room_title: room_title.to_string(),
+            enabled: true,
+            created_at: timestamp("2026-06-04 00:00:00"),
+            updated_at: timestamp("2026-06-04 00:00:00"),
         }
     }
 
@@ -294,7 +299,7 @@ mod tests {
     fn feed_items_skip_streams_before_minimum_live_age() {
         let items = build_live_feed_items(
             vec![live_state("dawu", "2026-06-04 12:00:01")],
-            vec![user_model(1, "dawu", "大雾的游戏时间")],
+            vec![live_room_model(1, "dawu", "大雾的游戏时间")],
             timestamp("2026-06-04 12:01:00"),
             "https://live.example.test",
             None,
@@ -307,7 +312,7 @@ mod tests {
     fn feed_items_use_episode_start_as_stable_guid() {
         let items = build_live_feed_items(
             vec![live_state("dawu", "2026-06-04 12:00:00")],
-            vec![user_model(1, "dawu", "大雾的游戏时间")],
+            vec![live_room_model(1, "dawu", "大雾的游戏时间")],
             timestamp("2026-06-04 12:01:00"),
             "https://live.example.test",
             None,
@@ -327,7 +332,7 @@ mod tests {
                 "2026-06-04 12:00:00",
                 "2026-06-04 12:05:30",
             )],
-            vec![user_model(1, "dawu", "大雾的游戏时间")],
+            vec![live_room_model(1, "dawu", "大雾的游戏时间")],
             timestamp("2026-06-04 12:06:00"),
             "https://live.example.test",
             None,
@@ -354,8 +359,8 @@ mod tests {
                 ),
             ],
             vec![
-                user_model(1, "dawu", "大雾的游戏时间"),
-                user_model(2, "ytb", "YTB"),
+                live_room_model(1, "dawu", "大雾的游戏时间"),
+                live_room_model(2, "ytb", "YTB"),
             ],
             timestamp("2026-06-04 12:06:30"),
             "https://live.example.test",
