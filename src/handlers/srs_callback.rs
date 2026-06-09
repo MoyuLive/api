@@ -1,11 +1,14 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{Duration, NaiveDateTime};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    Set,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{error, info, warn};
+use url::form_urlencoded;
 
 use crate::entities::{forward_rule, live_session, live_stream_state, srs_server, user};
 use crate::AppState;
@@ -75,6 +78,29 @@ pub struct PlayBody {
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
+pub struct ForwardBody {
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub app: String,
+    #[serde(default)]
+    pub stream: String,
+    #[serde(default)]
+    pub param: String,
+    #[serde(default, alias = "tcUrl")]
+    pub tc_url: String,
+    #[serde(default)]
+    pub vhost: String,
+    #[serde(default, alias = "client_id")]
+    pub client_id: String,
+    #[serde(default, alias = "server_id")]
+    pub server_id: String,
+    #[serde(default)]
+    pub ip: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 pub struct StopBody {
     #[serde(default)]
     pub action: String,
@@ -120,15 +146,90 @@ struct CallbackData {
 
 fn parse_token_from_param(param: &str) -> Option<String> {
     let param = param.strip_prefix('?').unwrap_or(param);
-    for pair in param.split('&') {
-        let mut kv = pair.splitn(2, '=');
-        if let (Some("token"), Some(val)) = (kv.next(), kv.next()) {
-            if !val.is_empty() {
-                return Some(val.to_string());
+    for (key, value) in form_urlencoded::parse(param.as_bytes()) {
+        if key == "token" && !value.is_empty() {
+            return Some(value.into_owned());
+        }
+        if key == "streamid" {
+            if let Some(token) = parse_token_from_srt_stream_id(&value) {
+                return Some(token);
             }
         }
     }
+
+    parse_token_from_srt_stream_id(param)
+}
+
+fn parse_token_from_srt_stream_id(stream_id: &str) -> Option<String> {
+    for part in stream_id.split([',', '&']) {
+        let mut kv = part.splitn(2, '=');
+        if let (Some("token"), Some(value)) = (kv.next().map(str::trim), kv.next()) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
     None
+}
+
+fn forward_rule_filters(app: &str, stream: &str) -> Vec<String> {
+    let mut filters = Vec::from(["*".to_string()]);
+
+    if !stream.is_empty() {
+        filters.push(stream.to_string());
+    }
+
+    if !app.is_empty() {
+        filters.push(format!("{}/*", app));
+        if !stream.is_empty() {
+            filters.push(format!("{}/{}", app, stream));
+        }
+    }
+
+    filters.sort();
+    filters.dedup();
+    filters
+}
+
+fn render_forward_target_url(template: &str, app: &str, stream: &str) -> String {
+    template
+        .replace("{app}", app)
+        .replace("{stream}", stream)
+        .replace("[app]", app)
+        .replace("[stream]", stream)
+}
+
+fn forward_urls_from_rules(
+    rules: Vec<forward_rule::Model>,
+    app: &str,
+    stream: &str,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+
+    for rule in rules {
+        let url = render_forward_target_url(&rule.target_url, app, stream);
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
+
+    urls
+}
+
+async fn matching_forward_rules(
+    db: &DatabaseConnection,
+    app: &str,
+    stream: &str,
+) -> Result<Vec<forward_rule::Model>, DbErr> {
+    forward_rule::Entity::find()
+        .filter(forward_rule::Column::Enabled.eq(true))
+        .filter(forward_rule::Column::StreamFilter.is_in(forward_rule_filters(app, stream)))
+        .order_by_asc(forward_rule::Column::Id)
+        .all(db)
+        .await
 }
 
 fn next_episode_started_at(
@@ -321,48 +422,47 @@ pub async fn on_publish(
         error!("on_publish: failed to update live stream state: {}", e);
     }
 
-    let stream_key = format!("{}/{}", body.app, body.stream);
-    let rules = match forward_rule::Entity::find()
-        .filter(
-            forward_rule::Column::Enabled.eq(true).and(
-                forward_rule::Column::StreamFilter
-                    .eq("*")
-                    .or(forward_rule::Column::StreamFilter.eq(&stream_key)),
-            ),
-        )
-        .all(&state.db)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!("on_publish: failed to query forward rules: {}", e);
-            vec![]
-        }
-    };
-
     info!(
         stream = %body.stream,
         user_id = user_model.id,
-        forward_rules = rules.len(),
         "on_publish: stream allowed"
     );
-
-    if !rules.is_empty() {
-        let urls: Vec<String> = rules.into_iter().map(|r| r.target_url).collect();
-        return (
-            StatusCode::OK,
-            Json(CallbackResponse {
-                code: 0,
-                data: Some(CallbackData { urls }),
-            }),
-        );
-    }
 
     (
         StatusCode::OK,
         Json(CallbackResponse {
             code: 0,
             data: None,
+        }),
+    )
+}
+
+// POST /api/internal/srs/on_forward
+pub async fn on_forward(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ForwardBody>,
+) -> impl IntoResponse {
+    let rules = match matching_forward_rules(&state.db, &body.app, &body.stream).await {
+        Ok(rules) => rules,
+        Err(e) => {
+            error!("on_forward: failed to query forward rules: {}", e);
+            Vec::new()
+        }
+    };
+    let urls = forward_urls_from_rules(rules, &body.app, &body.stream);
+
+    info!(
+        app = %body.app,
+        stream = %body.stream,
+        forward_urls = urls.len(),
+        "on_forward callback"
+    );
+
+    (
+        StatusCode::OK,
+        Json(CallbackResponse {
+            code: 0,
+            data: Some(CallbackData { urls }),
         }),
     )
 }
@@ -498,7 +598,7 @@ mod tests {
     use sea_orm::{DbBackend, MockDatabase, MockExecResult};
 
     use crate::config::{
-        AppConfig, DbConfig, MetricsConfig, PlaybackConfig, SrsConfig, UserConfig,
+        AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig, UserConfig,
     };
     use crate::entities::live_stream_state;
     use crate::srs_client::SrsClient;
@@ -525,6 +625,9 @@ mod tests {
                 playback: PlaybackConfig {
                     protocols: "webrtc,hls".to_string(),
                 },
+                publish: PublishConfig {
+                    protocols: "rtmp,whip".to_string(),
+                },
                 metrics: MetricsConfig { enabled: false },
                 cors_origins: vec!["http://localhost:5173".to_string()],
             }),
@@ -536,13 +639,16 @@ mod tests {
         })
     }
 
-    async fn callback_code(response: impl IntoResponse) -> i32 {
+    async fn callback_json(response: impl IntoResponse) -> serde_json::Value {
         let response = response.into_response();
         let body = to_bytes(response.into_body(), 1024)
             .await
             .expect("callback body should be readable");
         serde_json::from_slice::<serde_json::Value>(&body).expect("callback body should be json")
-            ["code"]
+    }
+
+    async fn callback_code(response: impl IntoResponse) -> i32 {
+        callback_json(response).await["code"]
             .as_i64()
             .expect("callback code should be an integer") as i32
     }
@@ -557,11 +663,6 @@ mod tests {
                 stream_code: "valid-stream-code".to_string(),
                 room_title: String::new(),
             }]])
-            .append_exec_results([MockExecResult {
-                last_insert_id: 1,
-                rows_affected: 1,
-            }])
-            .append_query_results([Vec::<forward_rule::Model>::new()])
             .into_connection();
 
         let code = callback_code(
@@ -585,6 +686,24 @@ mod tests {
         assert_eq!(code, 1);
     }
 
+    #[test]
+    fn parse_token_supports_rtmp_whip_and_srt_params() {
+        assert_eq!(
+            parse_token_from_param("?token=stream-token"),
+            Some("stream-token".to_string())
+        );
+        assert_eq!(
+            parse_token_from_param("?app=live&stream=dawu&token=stream-token"),
+            Some("stream-token".to_string())
+        );
+        assert_eq!(
+            parse_token_from_param(
+                "?streamid=%23%21%3A%3Ar%3Dlive%2Fdawu%2Cm%3Dpublish%2Ctoken%3Dstream-token"
+            ),
+            Some("stream-token".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn on_publish_allows_valid_token_for_own_stream() {
         let db = MockDatabase::new(DbBackend::Postgres)
@@ -595,11 +714,17 @@ mod tests {
                 stream_code: "valid-stream-code".to_string(),
                 room_title: String::new(),
             }]])
-            .append_exec_results([MockExecResult {
-                last_insert_id: 1,
-                rows_affected: 1,
-            }])
-            .append_query_results([Vec::<forward_rule::Model>::new()])
+            .append_exec_results([
+                MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                },
+                MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                },
+            ])
+            .append_query_results([Vec::<live_stream_state::Model>::new()])
             .into_connection();
 
         let code = callback_code(
@@ -621,6 +746,68 @@ mod tests {
         .await;
 
         assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn on_forward_returns_matching_rules_and_expands_templates() {
+        let now =
+            NaiveDateTime::parse_from_str("2026-06-04 12:00:00", "%F %T").expect("valid time");
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[
+                forward_rule::Model {
+                    id: 1,
+                    stream_filter: "*".to_string(),
+                    target_url: "rtmp://edge.example/live/{stream}".to_string(),
+                    enabled: true,
+                    created_at: now,
+                    updated_at: now,
+                },
+                forward_rule::Model {
+                    id: 2,
+                    stream_filter: "live/dawu".to_string(),
+                    target_url: "rtmp://backup.example/{app}/{stream}".to_string(),
+                    enabled: true,
+                    created_at: now,
+                    updated_at: now,
+                },
+            ]])
+            .into_connection();
+
+        let json = callback_json(
+            on_forward(
+                State(test_state(db)),
+                Json(ForwardBody {
+                    action: "on_forward".to_string(),
+                    app: "live".to_string(),
+                    stream: "dawu".to_string(),
+                    param: String::new(),
+                    tc_url: "rtmp://live.example.test/live".to_string(),
+                    vhost: "__defaultVhost__".to_string(),
+                    client_id: "client-1".to_string(),
+                    server_id: "server-1".to_string(),
+                    ip: "127.0.0.1".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(json["code"], 0);
+        assert_eq!(
+            json["data"]["urls"],
+            serde_json::json!([
+                "rtmp://edge.example/live/dawu",
+                "rtmp://backup.example/live/dawu"
+            ])
+        );
+    }
+
+    #[test]
+    fn forward_rule_filters_cover_global_stream_app_and_exact() {
+        assert_eq!(
+            forward_rule_filters("live", "dawu"),
+            vec!["*", "dawu", "live/*", "live/dawu"]
+        );
     }
 
     fn live_state(

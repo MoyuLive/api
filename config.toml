@@ -1,4 +1,10 @@
 http_port = 9081
+cors_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+]
 
 [db]
 dsn = "host=localhost user=postgres password=postgres dbname=yantube port=5432 sslmode=disable"
@@ -16,6 +22,9 @@ callback_secret = "secret"
 
 [playback]
 protocols = "webrtc,hls"
+
+[publish]
+protocols = "rtmp,whip"
 
 [metrics]
 enabled = true

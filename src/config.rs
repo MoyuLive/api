@@ -19,6 +19,8 @@ pub struct AppConfig {
     pub srs: SrsConfig,
     #[serde(default = "default_playback_config")]
     pub playback: PlaybackConfig,
+    #[serde(default = "default_publish_config")]
+    pub publish: PublishConfig,
     pub metrics: MetricsConfig,
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
@@ -83,16 +85,47 @@ fn default_playback_protocols() -> String {
 
 pub fn parse_playback_protocols(raw: &str) -> Vec<String> {
     const SUPPORTED: &[&str] = &["webrtc", "hls", "flv"];
+    parse_protocol_list(raw, SUPPORTED, &default_playback_protocols())
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PublishConfig {
+    #[serde(default = "default_publish_protocols")]
+    pub protocols: String,
+}
+
+impl PublishConfig {
+    pub fn protocols(&self) -> Vec<String> {
+        parse_publish_protocols(&self.protocols)
+    }
+}
+
+fn default_publish_config() -> PublishConfig {
+    PublishConfig {
+        protocols: default_publish_protocols(),
+    }
+}
+
+fn default_publish_protocols() -> String {
+    "rtmp,whip".into()
+}
+
+pub fn parse_publish_protocols(raw: &str) -> Vec<String> {
+    const SUPPORTED: &[&str] = &["rtmp", "whip", "srt"];
+    parse_protocol_list(raw, SUPPORTED, &default_publish_protocols())
+}
+
+fn parse_protocol_list(raw: &str, supported: &[&str], fallback: &str) -> Vec<String> {
     let mut protocols = Vec::new();
 
     for protocol in raw.split(',').map(|p| p.trim().to_ascii_lowercase()) {
-        if SUPPORTED.contains(&protocol.as_str()) && !protocols.contains(&protocol) {
+        if supported.contains(&protocol.as_str()) && !protocols.contains(&protocol) {
             protocols.push(protocol);
         }
     }
 
     if protocols.is_empty() {
-        parse_playback_protocols(&default_playback_protocols())
+        parse_protocol_list(fallback, supported, fallback)
     } else {
         protocols
     }
@@ -109,7 +142,12 @@ fn default_true() -> bool {
 }
 
 fn default_cors_origins() -> Vec<String> {
-    vec!["http://localhost:5173".to_string()]
+    vec![
+        "http://localhost:5173".to_string(),
+        "http://127.0.0.1:5173".to_string(),
+        "http://localhost:5174".to_string(),
+        "http://127.0.0.1:5174".to_string(),
+    ]
 }
 
 pub fn load_config(config_path: &str) -> Result<Arc<AppConfig>, ConfigError> {
@@ -145,6 +183,7 @@ mod tests {
         "STREAM_API_SRS__API_PASSWORD",
         "STREAM_API_SRS__CALLBACK_SECRET",
         "STREAM_API_PLAYBACK__PROTOCOLS",
+        "STREAM_API_PUBLISH__PROTOCOLS",
         "STREAM_API_METRICS__ENABLED",
     ];
 
@@ -187,6 +226,10 @@ mod tests {
             "STREAM_API_PLAYBACK__PROTOCOLS",
             "webrtc, flv, unknown, hls, flv",
         );
+        env::set_var(
+            "STREAM_API_PUBLISH__PROTOCOLS",
+            "rtmp, srt, unknown, whip, srt",
+        );
         env::set_var("STREAM_API_METRICS__ENABLED", "false");
 
         let config = load_config("/private/tmp/moyulive-missing-config.toml")
@@ -204,6 +247,7 @@ mod tests {
         assert_eq!(config.srs.api_password, "srs-password");
         assert_eq!(config.srs.callback_secret, "callback-secret");
         assert_eq!(config.playback.protocols(), vec!["webrtc", "flv", "hls"]);
+        assert_eq!(config.publish.protocols(), vec!["rtmp", "srt", "whip"]);
         assert!(!config.metrics.enabled);
     }
 
@@ -225,5 +269,15 @@ mod tests {
             .expect("config should load with default playback protocols");
 
         assert_eq!(config.playback.protocols(), vec!["webrtc", "hls"]);
+        assert_eq!(config.publish.protocols(), vec!["rtmp", "whip"]);
+    }
+
+    #[test]
+    fn publish_protocols_reject_unknown_values_and_deduplicate() {
+        assert_eq!(
+            parse_publish_protocols("srt, unknown, rtmp, srt"),
+            vec!["srt", "rtmp"]
+        );
+        assert_eq!(parse_publish_protocols("unknown"), vec!["rtmp", "whip"]);
     }
 }

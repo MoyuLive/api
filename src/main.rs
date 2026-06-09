@@ -12,7 +12,7 @@ use axum::{
     http::{header, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
     Router,
 };
 use clap::Parser;
@@ -82,17 +82,27 @@ async fn validate_callback_secret(
         .uri()
         .query()
         .map(|q| {
-            q.split('&').any(|kv| {
-                let mut parts = kv.splitn(2, '=');
-                parts.next() == Some("callback_secret") && parts.next() == Some(secret.as_str())
-            })
+            url::form_urlencoded::parse(q.as_bytes())
+                .any(|(key, value)| key == "callback_secret" && value.as_ref() == secret.as_str())
         })
         .unwrap_or(false);
 
-    if header_match || query_match {
+    let heartbeat_path_match = req
+        .uri()
+        .path()
+        .strip_prefix("/api/internal/srs/heartbeat/")
+        .map(|value| value.trim_end_matches('/') == secret)
+        .unwrap_or(false);
+
+    if header_match || query_match || heartbeat_path_match {
         Ok(next.run(req).await)
     } else {
-        tracing::warn!("validate_callback_secret: secret mismatch or missing, returning 403");
+        tracing::warn!(
+            path = %req.uri().path(),
+            has_query = req.uri().query().is_some(),
+            has_secret_header = req.headers().contains_key("x-srs-callback-secret"),
+            "validate_callback_secret: secret mismatch or missing, returning 403"
+        );
         Err(StatusCode::FORBIDDEN)
     }
 }
@@ -147,6 +157,10 @@ async fn main() {
             post(handlers::srs_callback::on_publish),
         )
         .route(
+            "/api/internal/srs/on_forward",
+            post(handlers::srs_callback::on_forward),
+        )
+        .route(
             "/api/internal/srs/on_unpublish",
             post(handlers::srs_callback::on_unpublish),
         )
@@ -160,6 +174,10 @@ async fn main() {
         )
         .route(
             "/api/internal/srs/heartbeat",
+            post(handlers::srs_callback::heartbeat),
+        )
+        .route(
+            "/api/internal/srs/heartbeat/:callback_secret",
             post(handlers::srs_callback::heartbeat),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -177,6 +195,10 @@ async fn main() {
             post(handlers::live::reset_stream_code),
         )
         .route(
+            "/api/publish/protocols",
+            get(handlers::playback::publish_protocols),
+        )
+        .route(
             "/api/live/room/title",
             put(handlers::live::update_room_title),
         )
@@ -190,7 +212,7 @@ async fn main() {
         .route("/api/live/forward/rules", post(handlers::forward::add))
         .route(
             "/api/live/forward/rules/:id",
-            delete(handlers::forward::delete),
+            put(handlers::forward::update).delete(handlers::forward::delete),
         )
         .route("/api/system/status", get(handlers::system::status))
         .route_layer(middleware::from_fn_with_state(
