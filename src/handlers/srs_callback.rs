@@ -625,7 +625,8 @@ mod tests {
     use sea_orm::{DbBackend, MockDatabase, MockExecResult};
 
     use crate::config::{
-        AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig, UserConfig,
+        AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig,
+        StorageConfig, UserConfig,
     };
     use crate::entities::live_stream_state;
     use crate::srs_client::SrsClient;
@@ -654,6 +655,9 @@ mod tests {
                 },
                 publish: PublishConfig {
                     protocols: "rtmp,whip".to_string(),
+                },
+                storage: StorageConfig {
+                    upload_dir: "uploads-test".to_string(),
                 },
                 metrics: MetricsConfig { enabled: false },
                 cors_origins: vec!["http://localhost:5173".to_string()],
@@ -688,6 +692,7 @@ mod tests {
             user_id: 1,
             stream_id: stream_id.to_string(),
             title: String::new(),
+            cover_url: String::new(),
             stream_code: stream_code.to_string(),
             enabled: true,
             created_at: now,

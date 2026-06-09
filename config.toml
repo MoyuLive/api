@@ -26,5 +26,8 @@ protocols = "webrtc,hls"
 [publish]
 protocols = "rtmp,whip"
 
+[storage]
+upload_dir = "uploads"
+
 [metrics]
 enabled = true

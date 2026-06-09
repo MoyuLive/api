@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub playback: PlaybackConfig,
     #[serde(default = "default_publish_config")]
     pub publish: PublishConfig,
+    #[serde(default = "default_storage_config")]
+    pub storage: StorageConfig,
     pub metrics: MetricsConfig,
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
@@ -115,6 +117,22 @@ pub fn parse_publish_protocols(raw: &str) -> Vec<String> {
     parse_protocol_list(raw, SUPPORTED, &default_publish_protocols())
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct StorageConfig {
+    #[serde(default = "default_upload_dir")]
+    pub upload_dir: String,
+}
+
+fn default_storage_config() -> StorageConfig {
+    StorageConfig {
+        upload_dir: default_upload_dir(),
+    }
+}
+
+fn default_upload_dir() -> String {
+    "uploads".into()
+}
+
 fn parse_protocol_list(raw: &str, supported: &[&str], fallback: &str) -> Vec<String> {
     let mut protocols = Vec::new();
 
@@ -184,6 +202,7 @@ mod tests {
         "STREAM_API_SRS__CALLBACK_SECRET",
         "STREAM_API_PLAYBACK__PROTOCOLS",
         "STREAM_API_PUBLISH__PROTOCOLS",
+        "STREAM_API_STORAGE__UPLOAD_DIR",
         "STREAM_API_METRICS__ENABLED",
     ];
 

@@ -10,6 +10,7 @@ pub struct Model {
     #[sea_orm(unique)]
     pub stream_id: String,
     pub title: String,
+    pub cover_url: String,
     pub stream_code: String,
     pub enabled: bool,
     pub created_at: DateTime,

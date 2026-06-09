@@ -288,6 +288,7 @@ mod tests {
             user_id: id,
             stream_id: stream_id.to_string(),
             title: title.to_string(),
+            cover_url: String::new(),
             stream_code: "stream-code".to_string(),
             enabled: true,
             created_at: timestamp("2026-06-04 00:00:00"),

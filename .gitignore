@@ -1,3 +1,4 @@
 /target
 config.test.toml
 docker-compose.test.yml
+uploads/

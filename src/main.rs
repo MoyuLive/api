@@ -8,7 +8,7 @@ mod srs_client;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -18,8 +18,7 @@ use axum::{
 use clap::Parser;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -247,6 +246,18 @@ async fn main() {
             put(handlers::live::update_room_title),
         )
         .route(
+            "/api/live/room/cover",
+            put(handlers::live::update_room_cover).route_layer(DefaultBodyLimit::max(
+                handlers::live::MAX_COVER_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/live/rooms/:id/cover",
+            put(handlers::live::update_room_cover_by_id).route_layer(DefaultBodyLimit::max(
+                handlers::live::MAX_COVER_REQUEST_BYTES,
+            )),
+        )
+        .route(
             "/api/live/stream/status",
             get(handlers::live::stream_status),
         )
@@ -283,10 +294,12 @@ async fn main() {
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
     };
 
+    let uploads_dir = state.config.storage.upload_dir.clone();
     let app = Router::new()
         .merge(public_routes)
         .merge(srs_callback_routes)
         .merge(protected_routes)
+        .nest_service("/uploads", ServeDir::new(uploads_dir))
         .layer(cors_layer)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

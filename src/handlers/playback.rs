@@ -43,7 +43,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig, UserConfig,
+        AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig,
+        StorageConfig, UserConfig,
     };
     use crate::srs_client::SrsClient;
     use crate::AppState;
@@ -76,6 +77,9 @@ mod tests {
                 },
                 publish: PublishConfig {
                     protocols: publish_protocols.to_string(),
+                },
+                storage: StorageConfig {
+                    upload_dir: "uploads-test".to_string(),
                 },
                 metrics: MetricsConfig { enabled: false },
                 cors_origins: vec!["http://localhost:5173".to_string()],

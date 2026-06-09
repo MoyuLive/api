@@ -1,7 +1,7 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Multipart, Path as AxumPath, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -10,7 +10,8 @@ use sea_orm::{
     Set,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc};
+use tokio::fs;
 use tracing::{error, info};
 
 use crate::auth::{generate_random_string, CurrentUser};
@@ -20,11 +21,16 @@ use crate::srs_client::SrsStream;
 use crate::AppState;
 
 const MAX_ROOM_TITLE_CHARS: usize = 80;
+pub(crate) const MAX_COVER_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const MAX_COVER_REQUEST_BYTES: usize = MAX_COVER_UPLOAD_BYTES + 64 * 1024;
+const COVER_DIR_NAME: &str = "covers";
+const COVER_PUBLIC_PREFIX: &str = "/uploads/covers/";
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct PublicLiveRoom {
     pub stream_id: String,
     pub title: String,
+    pub cover_url: String,
     pub app: String,
     pub status: String,
     pub started_at_ms: Option<i64>,
@@ -85,6 +91,7 @@ pub async fn stream_code(
             "stream_id": room.stream_id,
             "username": auth_user.username,
             "title": room.title,
+            "cover_url": room.cover_url,
         })),
     )
 }
@@ -127,6 +134,7 @@ pub async fn reset_stream_code(
                     "stream_id": updated_room.stream_id,
                     "username": auth_user.username,
                     "title": updated_room.title,
+                    "cover_url": updated_room.cover_url,
                 })),
             )
         }
@@ -189,6 +197,7 @@ pub async fn update_room_title(
                     "stream_id": updated_room.stream_id,
                     "username": auth_user.username,
                     "title": title,
+                    "cover_url": updated_room.cover_url,
                 })),
             )
         }
@@ -198,6 +207,195 @@ pub async fn update_room_title(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_response(500, "failed to update room title"),
             )
+        }
+    }
+}
+
+// PUT /api/live/room/cover
+pub async fn update_room_cover(
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let room = match default_live_room(&state.db, &auth_user).await {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "default live room not found"),
+            );
+        }
+        Err(e) => {
+            error!("Failed to get default live room: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to get live room"),
+            );
+        }
+    };
+
+    update_room_cover_file(&state, &auth_user, room, &mut multipart).await
+}
+
+// PUT /api/live/rooms/:id/cover
+pub async fn update_room_cover_by_id(
+    AxumPath(id): AxumPath<i32>,
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let room = match live_room::Entity::find_by_id(id).one(&state.db).await {
+        Ok(Some(room)) => room,
+        Ok(None) => return (StatusCode::NOT_FOUND, error_response(404, "room not found")),
+        Err(e) => {
+            error!("Failed to find live room before cover update: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to find live room"),
+            );
+        }
+    };
+
+    if !auth_user.is_admin() && room.user_id != auth_user.user_id {
+        return (
+            StatusCode::FORBIDDEN,
+            error_response(403, "you can only update your own room cover"),
+        );
+    }
+
+    update_room_cover_file(&state, &auth_user, room, &mut multipart).await
+}
+
+async fn update_room_cover_file(
+    state: &Arc<AppState>,
+    auth_user: &CurrentUser,
+    room: live_room::Model,
+    multipart: &mut Multipart,
+) -> (StatusCode, Response) {
+    let (bytes, extension) = match read_cover_upload(multipart).await {
+        Ok(upload) => upload,
+        Err(message) => return (StatusCode::BAD_REQUEST, error_response(400, message)),
+    };
+
+    let cover_url =
+        match save_cover_file(&state.config.storage.upload_dir, room.id, &bytes, extension).await {
+            Ok(cover_url) => cover_url,
+            Err(e) => {
+                error!("Failed to save room cover: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response(500, "failed to save room cover"),
+                );
+            }
+        };
+
+    let previous_cover_url = room.cover_url.clone();
+    let mut active: live_room::ActiveModel = room.into();
+    active.cover_url = Set(cover_url.clone());
+    active.updated_at = Set(Utc::now().naive_utc());
+
+    match active.update(&state.db).await {
+        Ok(updated_room) => {
+            remove_cover_file(&state.config.storage.upload_dir, &previous_cover_url).await;
+            (
+                StatusCode::OK,
+                success_response(serde_json::json!({
+                    "id": updated_room.id,
+                    "stream_id": updated_room.stream_id,
+                    "username": auth_user.username,
+                    "cover_url": updated_room.cover_url,
+                })),
+            )
+        }
+        Err(e) => {
+            error!("Failed to update room cover: {}", e);
+            remove_cover_file(&state.config.storage.upload_dir, &cover_url).await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to update room cover"),
+            )
+        }
+    }
+}
+
+async fn read_cover_upload(
+    multipart: &mut Multipart,
+) -> Result<(Vec<u8>, &'static str), &'static str> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| "failed to read cover upload")?
+    {
+        if field.name() != Some("cover") {
+            continue;
+        }
+
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|_| "failed to read cover upload")?;
+        if bytes.is_empty() {
+            return Err("cover image is empty");
+        }
+        if bytes.len() > MAX_COVER_UPLOAD_BYTES {
+            return Err("cover image is too large");
+        }
+
+        let extension = cover_image_extension(&bytes).ok_or("unsupported cover image type")?;
+        return Ok((bytes.to_vec(), extension));
+    }
+
+    Err("missing cover image")
+}
+
+fn cover_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("png");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+
+    None
+}
+
+async fn save_cover_file(
+    upload_dir: &str,
+    room_id: i32,
+    bytes: &[u8],
+    extension: &str,
+) -> Result<String, std::io::Error> {
+    let cover_dir = Path::new(upload_dir).join(COVER_DIR_NAME);
+    fs::create_dir_all(&cover_dir).await?;
+
+    let filename = format!(
+        "room-{}-{}-{}.{}",
+        room_id,
+        Utc::now().timestamp_millis(),
+        generate_random_string(8),
+        extension
+    );
+    let path = cover_dir.join(&filename);
+    fs::write(path, bytes).await?;
+
+    Ok(format!("{}{}", COVER_PUBLIC_PREFIX, filename))
+}
+
+async fn remove_cover_file(upload_dir: &str, cover_url: &str) {
+    let Some(filename) = cover_url.strip_prefix(COVER_PUBLIC_PREFIX) else {
+        return;
+    };
+    if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
+        return;
+    }
+
+    let path = Path::new(upload_dir).join(COVER_DIR_NAME).join(filename);
+    if let Err(e) = fs::remove_file(path).await {
+        if e.kind() != ErrorKind::NotFound {
+            error!("Failed to remove previous room cover: {}", e);
         }
     }
 }
@@ -498,6 +696,7 @@ fn build_public_live_rooms(
                 title: room
                     .map(|room| public_room_title(&room.title, &stream.name))
                     .unwrap_or_else(|| stream.name.clone()),
+                cover_url: room.map(|room| room.cover_url.clone()).unwrap_or_default(),
                 stream_id: stream.name,
                 app: stream.app,
                 status: "live".to_string(),
@@ -604,6 +803,7 @@ mod tests {
             user_id: 1,
             stream_id: stream_id.to_string(),
             title: title.to_string(),
+            cover_url: String::new(),
             stream_code: "stream-code".to_string(),
             enabled: true,
             created_at: now,
@@ -734,5 +934,23 @@ mod tests {
         let title = normalize_room_title(&"a".repeat(MAX_ROOM_TITLE_CHARS + 1));
 
         assert_eq!(title, Err("room title is too long"));
+    }
+
+    #[test]
+    fn cover_image_extension_detects_supported_formats_by_header() {
+        assert_eq!(
+            cover_image_extension(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("jpg")
+        );
+        assert_eq!(
+            cover_image_extension(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some("png")
+        );
+        assert_eq!(cover_image_extension(b"RIFFxxxxWEBPVP8 "), Some("webp"));
+    }
+
+    #[test]
+    fn cover_image_extension_rejects_unknown_formats() {
+        assert_eq!(cover_image_extension(b"not an image"), None);
     }
 }
