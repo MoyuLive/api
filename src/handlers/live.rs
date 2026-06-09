@@ -10,7 +10,12 @@ use sea_orm::{
     Set,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io::ErrorKind,
+    path::Path,
+    sync::Arc,
+};
 use tokio::fs;
 use tracing::{error, info};
 
@@ -41,6 +46,21 @@ pub struct PublicLiveRoom {
     pub send_kbps: Option<i32>,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct OwnLiveRoom {
+    pub id: i32,
+    pub user_id: i32,
+    pub username: String,
+    pub stream_id: String,
+    pub title: String,
+    pub cover_url: String,
+    pub stream_code: String,
+    pub enabled: bool,
+    pub status: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
 async fn default_live_room(
     db: &DatabaseConnection,
     auth_user: &CurrentUser,
@@ -60,6 +80,94 @@ async fn default_live_room(
         .order_by_asc(live_room::Column::Id)
         .one(db)
         .await
+}
+
+fn own_live_room_response(room: live_room::Model, username: &str, is_live: bool) -> OwnLiveRoom {
+    OwnLiveRoom {
+        id: room.id,
+        user_id: room.user_id,
+        username: username.to_string(),
+        stream_id: room.stream_id,
+        title: room.title,
+        cover_url: room.cover_url,
+        stream_code: room.stream_code,
+        enabled: room.enabled,
+        status: if is_live { "live" } else { "offline" }.to_string(),
+        created_at: room.created_at,
+        updated_at: room.updated_at,
+    }
+}
+
+fn build_own_live_room_responses(
+    rooms: Vec<live_room::Model>,
+    sessions: Vec<live_session::Model>,
+    username: &str,
+) -> Vec<OwnLiveRoom> {
+    let active_stream_ids: HashSet<String> = sessions
+        .into_iter()
+        .map(|session| session.stream_id)
+        .collect();
+
+    rooms
+        .into_iter()
+        .map(|room| {
+            let is_live = active_stream_ids.contains(&room.stream_id);
+            own_live_room_response(room, username, is_live)
+        })
+        .collect()
+}
+
+#[allow(clippy::result_large_err)]
+async fn owned_live_room_by_id(
+    db: &DatabaseConnection,
+    auth_user: &CurrentUser,
+    room_id: i32,
+) -> Result<live_room::Model, (StatusCode, Response)> {
+    let room = match live_room::Entity::find_by_id(room_id).one(db).await {
+        Ok(Some(room)) => room,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, error_response(404, "room not found"))),
+        Err(e) => {
+            error!("Failed to find owned live room: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to get live room"),
+            ));
+        }
+    };
+
+    if room.user_id != auth_user.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            error_response(403, "you can only manage your own live rooms"),
+        ));
+    }
+
+    Ok(room)
+}
+
+#[allow(clippy::result_large_err)]
+async fn load_own_live_room_response(
+    db: &DatabaseConnection,
+    auth_user: &CurrentUser,
+    room: live_room::Model,
+) -> Result<OwnLiveRoom, (StatusCode, Response)> {
+    let is_live = match live_session::Entity::find()
+        .filter(live_session::Column::StreamId.eq(&room.stream_id))
+        .filter(live_session::Column::Status.eq("active"))
+        .one(db)
+        .await
+    {
+        Ok(session) => session.is_some(),
+        Err(e) => {
+            error!("Failed to load owned room live session: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to load live session"),
+            ));
+        }
+    };
+
+    Ok(own_live_room_response(room, &auth_user.username, is_live))
 }
 
 // GET /api/live/stream/code
@@ -87,12 +195,63 @@ pub async fn stream_code(
     (
         StatusCode::OK,
         success_response(serde_json::json!({
+            "id": room.id,
             "stream_code": room.stream_code,
             "stream_id": room.stream_id,
             "username": auth_user.username,
             "title": room.title,
             "cover_url": room.cover_url,
+            "enabled": room.enabled,
         })),
+    )
+}
+
+// GET /api/live/my/rooms
+pub async fn my_live_rooms(
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+) -> impl IntoResponse {
+    let rooms = match live_room::Entity::find()
+        .filter(live_room::Column::UserId.eq(auth_user.user_id))
+        .order_by_asc(live_room::Column::Id)
+        .all(&state.db)
+        .await
+    {
+        Ok(rooms) => rooms,
+        Err(e) => {
+            error!("Failed to list owned live rooms: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to list live rooms"),
+            );
+        }
+    };
+
+    let stream_ids: Vec<String> = rooms.iter().map(|room| room.stream_id.clone()).collect();
+    let sessions = if stream_ids.is_empty() {
+        Vec::new()
+    } else {
+        match live_session::Entity::find()
+            .filter(live_session::Column::StreamId.is_in(stream_ids))
+            .filter(live_session::Column::Status.eq("active"))
+            .all(&state.db)
+            .await
+        {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                error!("Failed to load owned room sessions: {}", e);
+                Vec::new()
+            }
+        }
+    };
+
+    (
+        StatusCode::OK,
+        success_response(build_own_live_room_responses(
+            rooms,
+            sessions,
+            &auth_user.username,
+        )),
     )
 }
 
@@ -140,6 +299,39 @@ pub async fn reset_stream_code(
         }
         Err(e) => {
             error!("Failed to reset stream code: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to reset stream code"),
+            )
+        }
+    }
+}
+
+// POST /api/live/rooms/:id/stream-code/reset
+pub async fn reset_stream_code_by_id(
+    AxumPath(id): AxumPath<i32>,
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+) -> impl IntoResponse {
+    let room = match owned_live_room_by_id(&state.db, &auth_user, id).await {
+        Ok(room) => room,
+        Err(response) => return response,
+    };
+
+    let mut active: live_room::ActiveModel = room.into();
+    active.stream_code = Set(generate_random_string(16));
+    active.updated_at = Set(Utc::now().naive_utc());
+
+    match active.update(&state.db).await {
+        Ok(updated_room) => {
+            sync_legacy_user_room_fields(&state.db, &auth_user, &updated_room).await;
+            match load_own_live_room_response(&state.db, &auth_user, updated_room).await {
+                Ok(response) => (StatusCode::OK, success_response(response)),
+                Err(response) => response,
+            }
+        }
+        Err(e) => {
+            error!("Failed to reset owned room stream code: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_response(500, "failed to reset stream code"),
@@ -203,6 +395,47 @@ pub async fn update_room_title(
         }
         Err(e) => {
             error!("Failed to update room title: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to update room title"),
+            )
+        }
+    }
+}
+
+// PUT /api/live/rooms/:id/title
+pub async fn update_room_title_by_id(
+    AxumPath(id): AxumPath<i32>,
+    State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
+    Json(req): Json<UpdateRoomTitleRequest>,
+) -> impl IntoResponse {
+    let title = match normalize_room_title(&req.title) {
+        Ok(title) => title,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, error_response(400, message));
+        }
+    };
+
+    let room = match owned_live_room_by_id(&state.db, &auth_user, id).await {
+        Ok(room) => room,
+        Err(response) => return response,
+    };
+
+    let mut active: live_room::ActiveModel = room.into();
+    active.title = Set(title);
+    active.updated_at = Set(Utc::now().naive_utc());
+
+    match active.update(&state.db).await {
+        Ok(updated_room) => {
+            sync_legacy_user_room_fields(&state.db, &auth_user, &updated_room).await;
+            match load_own_live_room_response(&state.db, &auth_user, updated_room).await {
+                Ok(response) => (StatusCode::OK, success_response(response)),
+                Err(response) => response,
+            }
+        }
+        Err(e) => {
+            error!("Failed to update owned room title: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_response(500, "failed to update room title"),
@@ -811,6 +1044,19 @@ mod tests {
         }
     }
 
+    fn live_room_model_for_user(
+        id: i32,
+        user_id: i32,
+        stream_id: &str,
+        title: &str,
+    ) -> live_room::Model {
+        live_room::Model {
+            id,
+            user_id,
+            ..live_room_model(stream_id, title)
+        }
+    }
+
     fn live_room_model_with_id(id: i32, stream_id: &str, title: &str) -> live_room::Model {
         live_room::Model {
             id,
@@ -920,6 +1166,29 @@ mod tests {
         );
 
         assert_eq!(rooms[0].title, "dawu");
+    }
+
+    #[test]
+    fn own_rooms_include_stream_codes_and_live_status() {
+        let rooms = build_own_live_room_responses(
+            vec![
+                live_room_model_for_user(1, 7, "default", "默认"),
+                live_room_model_for_user(2, 7, "extra", "额外"),
+            ],
+            vec![live_session(
+                "extra",
+                NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%F %T")
+                    .expect("valid timestamp"),
+            )],
+            "alice",
+        );
+
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rooms[0].username, "alice");
+        assert_eq!(rooms[0].stream_code, "stream-code");
+        assert_eq!(rooms[0].status, "offline");
+        assert_eq!(rooms[1].stream_id, "extra");
+        assert_eq!(rooms[1].status, "live");
     }
 
     #[test]

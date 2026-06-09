@@ -232,10 +232,19 @@ async fn main() {
             "/api/admin/streams/:stream_id/stop",
             post(handlers::admin::stop_stream),
         )
+        .route("/api/live/my/rooms", get(handlers::live::my_live_rooms))
         .route("/api/live/stream/code", get(handlers::live::stream_code))
         .route(
             "/api/live/stream/code/reset",
             post(handlers::live::reset_stream_code),
+        )
+        .route(
+            "/api/live/rooms/:id/title",
+            put(handlers::live::update_room_title_by_id),
+        )
+        .route(
+            "/api/live/rooms/:id/stream-code/reset",
+            post(handlers::live::reset_stream_code_by_id),
         )
         .route(
             "/api/publish/protocols",
