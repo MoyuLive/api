@@ -46,6 +46,7 @@ mod tests {
         AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig,
         StorageConfig, UserConfig,
     };
+    use crate::live_hub::LiveHub;
     use crate::srs_client::SrsClient;
     use crate::AppState;
 
@@ -89,6 +90,7 @@ mod tests {
                 "admin".to_string(),
                 "password".to_string(),
             )),
+            live_hub: Arc::new(LiveHub::new()),
         })
     }
 

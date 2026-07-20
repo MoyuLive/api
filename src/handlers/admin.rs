@@ -18,6 +18,10 @@ use crate::entities::{live_room, live_session, live_stream_state, user};
 use crate::handlers::account::{validate_password, validate_username};
 use crate::handlers::live::normalize_room_title;
 use crate::response::{error_response, success_response};
+use crate::room_access::{prepare_privacy_update, RoomAccessError, RoomPrivacyInput};
+use crate::room_privacy::{
+    update_room_with_privacy_locked, LockedRoomUpdate, RoomPrivacyUpdateError, RoomUpdateActor,
+};
 use crate::AppState;
 
 #[derive(Debug, Serialize)]
@@ -48,6 +52,8 @@ pub struct AdminRoomResponse {
     pub cover_url: String,
     pub stream_code: String,
     pub enabled: bool,
+    pub require_login: bool,
+    pub has_password: bool,
     pub status: String,
     pub live_session: Option<live_session::Model>,
     pub created_at: chrono::NaiveDateTime,
@@ -83,6 +89,12 @@ pub struct CreateRoomRequest {
     pub title: String,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub require_login: bool,
+    #[serde(default)]
+    pub password_enabled: bool,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +107,12 @@ pub struct UpdateRoomRequest {
     pub title: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub require_login: Option<bool>,
+    #[serde(default)]
+    pub password_enabled: Option<bool>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -241,6 +259,8 @@ async fn room_response(
         cover_url: room.cover_url,
         stream_code: room.stream_code,
         enabled: room.enabled,
+        require_login: room.require_login,
+        has_password: !room.password_hash.is_empty(),
         status: if session.is_some() { "live" } else { "offline" }.to_string(),
         live_session: session,
         created_at: room.created_at,
@@ -734,6 +754,8 @@ pub async fn list_rooms(
                 cover_url: room.cover_url,
                 stream_code: room.stream_code,
                 enabled: room.enabled,
+                require_login: room.require_login,
+                has_password: !room.password_hash.is_empty(),
                 status: if session.is_some() { "live" } else { "offline" }.to_string(),
                 live_session: session,
                 created_at: room.created_at,
@@ -754,15 +776,24 @@ pub async fn create_room(
         return response;
     }
 
-    let owner = match ensure_user_exists(&state.db, req.user_id).await {
+    let CreateRoomRequest {
+        user_id,
+        stream_id,
+        title,
+        enabled,
+        require_login,
+        password_enabled,
+        password,
+    } = req;
+    let owner = match ensure_user_exists(&state.db, user_id).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let stream_id = match validate_stream_id(&req.stream_id) {
+    let stream_id = match validate_stream_id(&stream_id) {
         Ok(stream_id) => stream_id,
         Err(response) => return response,
     };
-    let title = match normalize_room_title(&req.title) {
+    let title = match normalize_room_title(&title) {
         Ok(title) => title,
         Err(message) => return (StatusCode::BAD_REQUEST, error_response(400, message)),
     };
@@ -788,12 +819,54 @@ pub async fn create_room(
         }
     }
 
+    let stream_code = generate_random_string(16);
+    let now = Utc::now().naive_utc();
+    let privacy = match prepare_privacy_update(
+        &live_room::Model {
+            id: 0,
+            user_id: owner.id,
+            stream_id: stream_id.clone(),
+            title: title.clone(),
+            cover_url: String::new(),
+            stream_code: stream_code.clone(),
+            enabled: enabled.unwrap_or(true),
+            require_login: false,
+            password_hash: String::new(),
+            access_revision: 0,
+            created_at: now,
+            updated_at: now,
+        },
+        RoomPrivacyInput {
+            require_login,
+            password_enabled,
+            password,
+        },
+    ) {
+        Ok(privacy) => privacy,
+        Err(RoomAccessError::MalformedPassword) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                error_response(400, "invalid password"),
+            );
+        }
+        Err(_) => {
+            error!("Failed to prepare room privacy for creation");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to create room"),
+            );
+        }
+    };
+
     let active = live_room::ActiveModel {
         user_id: Set(owner.id),
         stream_id: Set(stream_id),
         title: Set(title),
-        stream_code: Set(generate_random_string(16)),
-        enabled: Set(req.enabled.unwrap_or(true)),
+        stream_code: Set(stream_code),
+        enabled: Set(enabled.unwrap_or(true)),
+        require_login: Set(privacy.require_login),
+        password_hash: Set(privacy.password_hash),
+        access_revision: Set(0),
         ..Default::default()
     };
 
@@ -822,6 +895,119 @@ pub async fn update_room(
         return response;
     }
 
+    let super_only_change =
+        req.user_id.is_some() || req.stream_id.is_some() || req.enabled.is_some();
+    if super_only_change && !auth_user.is_super_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            error_response(403, "super admin required"),
+        );
+    }
+
+    let updates_privacy =
+        req.require_login.is_some() || req.password_enabled.is_some() || req.password.is_some();
+    if updates_privacy {
+        let user_id = match req.user_id {
+            Some(user_id) => match ensure_user_exists(&state.db, user_id).await {
+                Ok(owner) => Some(owner.id),
+                Err(response) => return response,
+            },
+            None => None,
+        };
+        let stream_id = match req.stream_id.as_deref() {
+            Some(stream_id) => {
+                let stream_id = match validate_stream_id(stream_id) {
+                    Ok(stream_id) => stream_id,
+                    Err(response) => return response,
+                };
+                match live_room::Entity::find()
+                    .filter(live_room::Column::StreamId.eq(&stream_id))
+                    .filter(live_room::Column::Id.ne(id))
+                    .one(&state.db)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            error_response(400, "stream id already exists"),
+                        );
+                    }
+                    Ok(None) => Some(stream_id),
+                    Err(e) => {
+                        error!("Failed to check room duplicate: {}", e);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            error_response(500, "failed to check room"),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+        let title = match req.title.as_deref() {
+            Some(title) => match normalize_room_title(title) {
+                Ok(title) => Some(title),
+                Err(message) => return (StatusCode::BAD_REQUEST, error_response(400, message)),
+            },
+            None => None,
+        };
+        let patch = LockedRoomUpdate {
+            require_login: req.require_login,
+            password_enabled: req.password_enabled,
+            password: req.password,
+            title,
+            user_id,
+            stream_id,
+            enabled: req.enabled,
+        };
+        let room = match update_room_with_privacy_locked(
+            &state.db,
+            id,
+            RoomUpdateActor::Admin,
+            patch,
+            Utc::now(),
+        )
+        .await
+        {
+            Ok(room) => room,
+            Err(RoomPrivacyUpdateError::NotFound) => {
+                return (StatusCode::NOT_FOUND, error_response(404, "room not found"));
+            }
+            Err(RoomPrivacyUpdateError::Forbidden) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    error_response(403, "room update forbidden"),
+                );
+            }
+            Err(RoomPrivacyUpdateError::Invalid(RoomAccessError::MalformedPassword)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    error_response(400, "invalid password"),
+                );
+            }
+            Err(RoomPrivacyUpdateError::Invalid(_)) => {
+                error!("Failed to update room privacy");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response(500, "failed to update room"),
+                );
+            }
+            Err(RoomPrivacyUpdateError::Database(database_error)) => {
+                let _ = database_error;
+                error!("Failed to update room privacy");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response(500, "failed to update room"),
+                );
+            }
+        };
+        sync_legacy_user_room_fields(&state.db, &room).await;
+        return match room_response(&state.db, room).await {
+            Ok(response) => (StatusCode::OK, success_response(response)),
+            Err(response) => response,
+        };
+    }
+
     let room = match live_room::Entity::find_by_id(id).one(&state.db).await {
         Ok(Some(room)) => room,
         Ok(None) => return (StatusCode::NOT_FOUND, error_response(404, "room not found")),
@@ -833,15 +1019,6 @@ pub async fn update_room(
             );
         }
     };
-
-    let super_only_change =
-        req.user_id.is_some() || req.stream_id.is_some() || req.enabled.is_some();
-    if super_only_change && !auth_user.is_super_admin() {
-        return (
-            StatusCode::FORBIDDEN,
-            error_response(403, "super admin required"),
-        );
-    }
 
     let mut active: live_room::ActiveModel = room.into();
     if let Some(user_id) = req.user_id {
@@ -1077,6 +1254,142 @@ pub async fn stop_stream(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error_response(500, "failed to stop stream"),
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        response::IntoResponse,
+        Json,
+    };
+    use sea_orm::{DbBackend, MockDatabase};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        config::{
+            AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig,
+            StorageConfig, UserConfig,
+        },
+        entities::user,
+        live_hub::LiveHub,
+        srs_client::SrsClient,
+    };
+
+    fn test_state(db: DatabaseConnection) -> Arc<AppState> {
+        Arc::new(AppState {
+            db,
+            config: Arc::new(AppConfig {
+                http_port: 9081,
+                db: DbConfig {
+                    dsn: "mock".to_string(),
+                },
+                user: UserConfig {
+                    allow_register: false,
+                    auth_realm: "stream api".to_string(),
+                    auth_secret: "admin-handler-test-secret".to_string(),
+                },
+                srs: SrsConfig {
+                    api_url: "http://srs:1985".to_string(),
+                    api_user: "admin".to_string(),
+                    api_password: "password".to_string(),
+                    callback_secret: "callback-secret".to_string(),
+                },
+                playback: PlaybackConfig {
+                    protocols: "webrtc,hls".to_string(),
+                },
+                publish: PublishConfig {
+                    protocols: "rtmp,whip".to_string(),
+                },
+                storage: StorageConfig {
+                    upload_dir: "uploads-test".to_string(),
+                },
+                metrics: MetricsConfig { enabled: false },
+                cors_origins: vec!["http://localhost:5173".to_string()],
+            }),
+            srs_client: Arc::new(SrsClient::new(
+                "http://srs:1985".to_string(),
+                "admin".to_string(),
+                "password".to_string(),
+            )),
+            live_hub: Arc::new(LiveHub::new()),
+        })
+    }
+
+    fn admin_user() -> CurrentUser {
+        CurrentUser {
+            username: "operator".to_string(),
+            user_id: 1,
+            role: "admin".to_string(),
+        }
+    }
+
+    fn room_owner() -> user::Model {
+        user::Model {
+            id: 7,
+            username: "room-owner".to_string(),
+            password: "password-hash".to_string(),
+            stream_code: "stream-code".to_string(),
+            room_title: String::new(),
+            role: "user".to_string(),
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_admin_cannot_combine_privacy_with_super_only_room_fields() {
+        let db = MockDatabase::new(DbBackend::Postgres).into_connection();
+        let response = update_room(
+            State(test_state(db)),
+            admin_user(),
+            Path(5),
+            Json(UpdateRoomRequest {
+                user_id: Some(9),
+                stream_id: None,
+                title: None,
+                enabled: None,
+                require_login: Some(true),
+                password_enabled: None,
+                password: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_password_room_rejects_missing_short_and_long_passwords() {
+        for password in [None, Some("short".to_string()), Some("a".repeat(65))] {
+            let db = MockDatabase::new(DbBackend::Postgres)
+                .append_query_results([[room_owner()]])
+                .append_query_results([Vec::<live_room::Model>::new()])
+                .into_connection();
+            let response = create_room(
+                State(test_state(db)),
+                CurrentUser {
+                    role: "super_admin".to_string(),
+                    ..admin_user()
+                },
+                Json(CreateRoomRequest {
+                    user_id: 7,
+                    stream_id: "password-room".to_string(),
+                    title: String::new(),
+                    enabled: None,
+                    require_login: false,
+                    password_enabled: true,
+                    password,
+                }),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 }

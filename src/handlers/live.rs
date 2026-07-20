@@ -44,6 +44,9 @@ pub struct PublicLiveRoom {
     pub video_height: Option<i32>,
     pub recv_kbps: Option<i32>,
     pub send_kbps: Option<i32>,
+    pub require_login: bool,
+    pub has_password: bool,
+    pub viewer_count: usize,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -56,6 +59,8 @@ pub struct OwnLiveRoom {
     pub cover_url: String,
     pub stream_code: String,
     pub enabled: bool,
+    pub require_login: bool,
+    pub has_password: bool,
     pub status: String,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -92,6 +97,8 @@ fn own_live_room_response(room: live_room::Model, username: &str, is_live: bool)
         cover_url: room.cover_url,
         stream_code: room.stream_code,
         enabled: room.enabled,
+        require_login: room.require_login,
+        has_password: !room.password_hash.is_empty(),
         status: if is_live { "live" } else { "offline" }.to_string(),
         created_at: room.created_at,
         updated_at: room.updated_at,
@@ -863,6 +870,7 @@ pub async fn public_live_rooms(State(state): State<Arc<AppState>>) -> impl IntoR
         .filter(SrsStream::is_publishing)
         .collect();
     let stream_ids: Vec<String> = streams.iter().map(|stream| stream.name.clone()).collect();
+    let viewer_counts = state.live_hub.viewer_counts(&stream_ids).await;
     let sessions = if stream_ids.is_empty() {
         Vec::new()
     } else {
@@ -900,7 +908,7 @@ pub async fn public_live_rooms(State(state): State<Arc<AppState>>) -> impl IntoR
         }
     };
 
-    let rooms = build_public_live_rooms(streams, sessions, rooms);
+    let rooms = build_public_live_rooms(streams, sessions, rooms, viewer_counts);
     (StatusCode::OK, success_response(rooms))
 }
 
@@ -908,6 +916,7 @@ fn build_public_live_rooms(
     streams: Vec<SrsStream>,
     sessions: Vec<live_session::Model>,
     rooms: Vec<live_room::Model>,
+    viewer_counts: HashMap<String, usize>,
 ) -> Vec<PublicLiveRoom> {
     let sessions_by_stream_id: HashMap<String, live_session::Model> = sessions
         .into_iter()
@@ -925,6 +934,7 @@ fn build_public_live_rooms(
             let session = sessions_by_stream_id.get(&stream.name);
             let room = rooms_by_stream_id.get(&stream.name);
             let started_at = session.map(|session| session.started_at);
+            let viewer_count = viewer_counts.get(&stream.name).copied().unwrap_or(0);
             PublicLiveRoom {
                 title: room
                     .map(|room| public_room_title(&room.title, &stream.name))
@@ -945,6 +955,11 @@ fn build_public_live_rooms(
                     .and_then(|video| positive_dimension(video.height)),
                 recv_kbps: stream.kbps.as_ref().map(|kbps| kbps.recv_30s),
                 send_kbps: stream.kbps.as_ref().map(|kbps| kbps.send_30s),
+                require_login: room.map(|room| room.require_login).unwrap_or(false),
+                has_password: room
+                    .map(|room| !room.password_hash.is_empty())
+                    .unwrap_or(false),
+                viewer_count,
             }
         })
         .collect();
@@ -1005,7 +1020,10 @@ fn normalize_srs_live_ms(value: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::auth::hash_password;
     use crate::srs_client::{SrsStreamKbps, SrsStreamPublish, SrsStreamVideo};
 
     fn live_session(stream_id: &str, started_at: NaiveDateTime) -> live_session::Model {
@@ -1039,6 +1057,9 @@ mod tests {
             cover_url: String::new(),
             stream_code: "stream-code".to_string(),
             enabled: true,
+            require_login: false,
+            password_hash: String::new(),
+            access_revision: 0,
             created_at: now,
             updated_at: now,
         }
@@ -1119,6 +1140,7 @@ mod tests {
                 live_session("offline-but-active-in-db", started_at),
             ],
             vec![live_room_model("dawu", "大雾的游戏时间")],
+            HashMap::new(),
         );
 
         assert_eq!(rooms.len(), 1);
@@ -1149,6 +1171,7 @@ mod tests {
                 live_room_model_with_id(1, "old", "旧直播间"),
                 live_room_model_with_id(2, "new", "新直播间"),
             ],
+            HashMap::new(),
         );
 
         let ids: Vec<&str> = rooms.iter().map(|room| room.stream_id.as_str()).collect();
@@ -1163,9 +1186,33 @@ mod tests {
             vec![srs_stream("dawu", 60_000)],
             vec![live_session("dawu", started_at)],
             vec![live_room_model("dawu", "   ")],
+            HashMap::new(),
         );
 
         assert_eq!(rooms[0].title, "dawu");
+    }
+
+    #[test]
+    fn public_live_rooms_keep_private_rooms_and_use_hub_viewer_counts() {
+        let started_at =
+            NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%F %T").expect("valid timestamp");
+        let mut room = live_room_model("private-room", "Private room");
+        room.require_login = true;
+        room.password_hash = hash_password("secret1");
+        let mut stream = srs_stream("private-room", 60_000);
+        stream.clients = 99;
+
+        let rooms = build_public_live_rooms(
+            vec![stream],
+            vec![live_session("private-room", started_at)],
+            vec![room],
+            HashMap::from([("private-room".to_string(), 2)]),
+        );
+
+        assert_eq!(rooms.len(), 1);
+        assert!(rooms[0].require_login);
+        assert!(rooms[0].has_password);
+        assert_eq!(rooms[0].viewer_count, 2);
     }
 
     #[test]
@@ -1186,6 +1233,8 @@ mod tests {
         assert_eq!(rooms.len(), 2);
         assert_eq!(rooms[0].username, "alice");
         assert_eq!(rooms[0].stream_code, "stream-code");
+        assert!(!rooms[0].require_login);
+        assert!(!rooms[0].has_password);
         assert_eq!(rooms[0].status, "offline");
         assert_eq!(rooms[1].stream_id, "extra");
         assert_eq!(rooms[1].status, "live");

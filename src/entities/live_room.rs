@@ -13,6 +13,10 @@ pub struct Model {
     pub cover_url: String,
     pub stream_code: String,
     pub enabled: bool,
+    pub require_login: bool,
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+    pub access_revision: i32,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }

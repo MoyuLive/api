@@ -90,12 +90,7 @@ where
             .map(|s| s.0.as_str())
             .unwrap_or("");
 
-        let token_data = decode::<Claims>(
-            token,
-            &DecodingKey::from_secret(secret.as_bytes()),
-            &Validation::default(),
-        )
-        .map_err(|_| {
+        let claims = decode_jwt(token, secret).map_err(|_| {
             (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
@@ -107,9 +102,9 @@ where
         })?;
 
         Ok(CurrentUser {
-            username: token_data.claims.username,
-            user_id: token_data.claims.user_id,
-            role: token_data.claims.role,
+            username: claims.username,
+            user_id: claims.user_id,
+            role: claims.role,
         })
     }
 }
@@ -137,6 +132,15 @@ pub fn create_jwt(
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
+}
+
+pub fn decode_jwt(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+    decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map(|token_data| token_data.claims)
 }
 
 // PBKDF2 password hashing - compatible with Go implementation

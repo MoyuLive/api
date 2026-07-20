@@ -1,5 +1,5 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use chrono::{Duration, NaiveDateTime};
+use chrono::{Duration, NaiveDateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
     Set,
@@ -10,8 +10,11 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use url::form_urlencoded;
 
-use crate::entities::{forward_rule, live_room, live_session, live_stream_state, srs_server, user};
-use crate::AppState;
+use crate::{
+    entities::{forward_rule, live_room, live_session, live_stream_state, srs_server, user},
+    room_access::admit_room_ticket_with_account_check,
+    AppState,
+};
 
 // SRS callback body types
 
@@ -162,6 +165,25 @@ fn parse_token_from_param(param: &str) -> Option<String> {
     }
 
     parse_token_from_srt_stream_id(param)
+}
+
+fn parse_room_ticket_from_param(param: &str) -> Option<String> {
+    let param = param.strip_prefix('?').unwrap_or(param);
+    let mut ticket = None;
+
+    for (key, value) in form_urlencoded::parse(param.as_bytes()) {
+        if key != "ticket" {
+            continue;
+        }
+
+        // Reject duplicate or empty ticket parameters rather than selecting an ambiguous value.
+        if ticket.is_some() || value.is_empty() {
+            return None;
+        }
+        ticket = Some(value.into_owned());
+    }
+
+    ticket
 }
 
 fn parse_token_from_srt_stream_id(stream_id: &str) -> Option<String> {
@@ -350,7 +372,6 @@ pub async fn on_publish(
         Ok(None) => {
             warn!(
                 stream = %body.stream,
-                stream_code = %stream_code,
                 "on_publish: invalid stream_code or disabled room, denying"
             );
             return (
@@ -522,6 +543,7 @@ pub async fn on_unpublish(
     if let Err(e) = mark_live_stream_unpublished(&state.db, &body.stream, now).await {
         error!("on_unpublish: failed to update live stream state: {}", e);
     }
+    state.live_hub.clear_stream(&body.stream).await;
 
     (
         StatusCode::OK,
@@ -534,10 +556,57 @@ pub async fn on_unpublish(
 
 // POST /api/internal/srs/on_play
 pub async fn on_play(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<PlayBody>,
 ) -> impl IntoResponse {
-    info!(stream = %body.stream, ip = %body.ip, "on_play callback");
+    let deny = |stream: &str| {
+        warn!(stream = %stream, reason = "room access denied", "on_play denied");
+        (
+            StatusCode::OK,
+            Json(CallbackResponse {
+                code: 1,
+                data: None,
+            }),
+        )
+    };
+
+    if body.stream.is_empty() || body.client_id.is_empty() {
+        return deny(&body.stream);
+    }
+
+    let Some(ticket) = parse_room_ticket_from_param(&body.param) else {
+        return deny(&body.stream);
+    };
+
+    let room = match live_room::Entity::find()
+        .filter(live_room::Column::StreamId.eq(&body.stream))
+        .filter(live_room::Column::Enabled.eq(true))
+        .one(&state.db)
+        .await
+    {
+        Ok(Some(room)) => room,
+        Ok(None) | Err(_) => return deny(&body.stream),
+    };
+
+    let claims = match admit_room_ticket_with_account_check(
+        &state.db,
+        &ticket,
+        &body.stream,
+        &room,
+        &state.config.user.auth_secret,
+        Utc::now(),
+    )
+    .await
+    {
+        Ok(claims) => claims,
+        Err(_) => return deny(&body.stream),
+    };
+
+    state
+        .live_hub
+        .play(&body.stream, &body.client_id, &claims.viewer_key)
+        .await;
+
     (
         StatusCode::OK,
         Json(CallbackResponse {
@@ -549,10 +618,13 @@ pub async fn on_play(
 
 // POST /api/internal/srs/on_stop
 pub async fn on_stop(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<StopBody>,
 ) -> impl IntoResponse {
-    info!(stream = %body.stream, "on_stop callback");
+    if !body.stream.is_empty() && !body.client_id.is_empty() {
+        state.live_hub.stop(&body.stream, &body.client_id).await;
+    }
+
     (
         StatusCode::OK,
         Json(CallbackResponse {
@@ -629,9 +701,13 @@ mod tests {
         StorageConfig, UserConfig,
     };
     use crate::entities::live_stream_state;
+    use crate::live_hub::LiveHub;
     use crate::srs_client::SrsClient;
 
-    fn test_state(db: sea_orm::DatabaseConnection) -> Arc<AppState> {
+    fn test_state_with_hub(
+        db: sea_orm::DatabaseConnection,
+        live_hub: Arc<LiveHub>,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             db,
             config: Arc::new(AppConfig {
@@ -667,7 +743,12 @@ mod tests {
                 "admin".to_string(),
                 "password".to_string(),
             )),
+            live_hub,
         })
+    }
+
+    fn test_state(db: sea_orm::DatabaseConnection) -> Arc<AppState> {
+        test_state_with_hub(db, Arc::new(LiveHub::new()))
     }
 
     async fn callback_json(response: impl IntoResponse) -> serde_json::Value {
@@ -695,12 +776,19 @@ mod tests {
             cover_url: String::new(),
             stream_code: stream_code.to_string(),
             enabled: true,
+            require_login: false,
+            password_hash: String::new(),
+            access_revision: 0,
             created_at: now,
             updated_at: now,
         }
     }
 
     fn user_model() -> user::Model {
+        user_model_with_enabled(true)
+    }
+
+    fn user_model_with_enabled(enabled: bool) -> user::Model {
         user::Model {
             id: 1,
             username: "dawu".to_string(),
@@ -708,8 +796,411 @@ mod tests {
             stream_code: "valid-stream-code".to_string(),
             room_title: String::new(),
             role: crate::auth::ROLE_USER.to_string(),
-            enabled: true,
+            enabled,
         }
+    }
+
+    fn play_body(stream: &str, param: String, client_id: &str) -> PlayBody {
+        PlayBody {
+            action: "on_play".to_string(),
+            app: "live".to_string(),
+            stream: stream.to_string(),
+            param,
+            page_url: String::new(),
+            vhost: "__defaultVhost__".to_string(),
+            client_id: client_id.to_string(),
+            ip: "127.0.0.1".to_string(),
+        }
+    }
+
+    fn room_ticket(room: &live_room::Model, viewer_key: &str, secret: &str, year: i32) -> String {
+        let issued_at = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, year, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid ticket timestamp");
+        crate::room_access::issue_room_ticket(
+            room,
+            viewer_key.to_string(),
+            crate::room_access::ViewerIdentity {
+                kind: crate::room_access::ViewerKind::Guest,
+                name: "Test viewer".to_string(),
+            },
+            None,
+            false,
+            false,
+            secret,
+            issued_at,
+        )
+        .expect("ticket should be issued")
+        .token
+    }
+
+    fn account_room_ticket(room: &live_room::Model, secret: &str, year: i32) -> String {
+        let issued_at = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, year, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid ticket timestamp");
+        crate::room_access::issue_room_ticket(
+            room,
+            "user:1".to_string(),
+            crate::room_access::ViewerIdentity {
+                kind: crate::room_access::ViewerKind::User,
+                name: "Test account".to_string(),
+            },
+            Some(1),
+            true,
+            false,
+            secret,
+            issued_at,
+        )
+        .expect("account ticket should be issued")
+        .token
+    }
+
+    #[tokio::test]
+    async fn on_play_denies_missing_or_invalid_room_tickets() {
+        let room = room_model("room-one", "stream-code");
+        let valid_ticket = room_ticket(
+            &room,
+            "guest:00000000-0000-0000-0000-000000000001",
+            "test-secret",
+            2099,
+        );
+        let wrong_signature = room_ticket(
+            &room,
+            "guest:00000000-0000-0000-0000-000000000001",
+            "wrong-secret",
+            2099,
+        );
+        let expired_ticket = room_ticket(
+            &room,
+            "guest:00000000-0000-0000-0000-000000000001",
+            "test-secret",
+            2000,
+        );
+        let other_room = room_model("room-two", "stream-code");
+        let other_room_ticket = room_ticket(
+            &other_room,
+            "guest:00000000-0000-0000-0000-000000000001",
+            "test-secret",
+            2099,
+        );
+        let mut stale_room = room.clone();
+        stale_room.access_revision = 1;
+
+        let denied_cases = vec![
+            (String::new(), room.clone()),
+            ("?ticket=".to_string(), room.clone()),
+            (format!("?token={valid_ticket}"), room.clone()),
+            (format!("?streamid=token={valid_ticket}"), room.clone()),
+            (
+                format!("?ticket={valid_ticket}&ticket={valid_ticket}"),
+                room.clone(),
+            ),
+            (format!("?ticket={wrong_signature}"), room.clone()),
+            (format!("?ticket={expired_ticket}"), room.clone()),
+            (format!("?ticket={other_room_ticket}"), room.clone()),
+            (format!("?ticket={valid_ticket}"), stale_room),
+        ];
+
+        for (param, room) in denied_cases {
+            let db = MockDatabase::new(DbBackend::Postgres)
+                .append_query_results([[room]])
+                .into_connection();
+            let code = callback_code(
+                on_play(
+                    State(test_state(db)),
+                    Json(play_body("room-one", param, "client-a")),
+                )
+                .await,
+            )
+            .await;
+
+            assert_eq!(code, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn on_play_denies_new_access_for_disabled_ticket_account() {
+        let room = room_model("room-one", "stream-code");
+        let ticket = account_room_ticket(&room, "test-secret", 2099);
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[room]])
+            .append_query_results([[user_model_with_enabled(false)]])
+            .into_connection();
+
+        let code = callback_code(
+            on_play(
+                State(test_state(db)),
+                Json(play_body(
+                    "room-one",
+                    format!("?ticket={ticket}"),
+                    "client-a",
+                )),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(code, 1);
+    }
+
+    #[tokio::test]
+    async fn on_play_tracks_viewers_idempotently_and_unpublish_clears_them() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let room = room_model("room-one", "stream-code");
+        let viewer_a_ticket = room_ticket(
+            &room,
+            "guest:00000000-0000-0000-0000-000000000001",
+            "test-secret",
+            2099,
+        );
+        let viewer_b_ticket = room_ticket(
+            &room,
+            "guest:00000000-0000-0000-0000-000000000002",
+            "test-secret",
+            2099,
+        );
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([
+                [room.clone()],
+                [room.clone()],
+                [room.clone()],
+                [room.clone()],
+            ])
+            .append_exec_results([
+                MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+                MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                },
+            ])
+            .into_connection();
+        let hub = Arc::new(LiveHub::new());
+        let (_, mut events) = hub.subscribe(&room.stream_id).await;
+        let state = test_state_with_hub(db, hub.clone());
+
+        assert_eq!(
+            callback_code(
+                on_play(
+                    State(state.clone()),
+                    Json(play_body(
+                        &room.stream_id,
+                        format!("?ticket={}", viewer_a_ticket.replace('.', "%2E")),
+                        "client-a",
+                    )),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count(&room.stream_id).await, 1);
+        assert_eq!(
+            events.try_recv().expect("first viewer count event"),
+            crate::live_hub::RoomEvent::ViewerCount { count: 1 }
+        );
+
+        assert_eq!(
+            callback_code(
+                on_play(
+                    State(state.clone()),
+                    Json(play_body(
+                        &room.stream_id,
+                        format!("?ticket={viewer_a_ticket}"),
+                        "client-a",
+                    )),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count(&room.stream_id).await, 1);
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+
+        assert_eq!(
+            callback_code(
+                on_play(
+                    State(state.clone()),
+                    Json(play_body(
+                        &room.stream_id,
+                        format!("?ticket={viewer_a_ticket}"),
+                        "client-b",
+                    )),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count(&room.stream_id).await, 1);
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+
+        assert_eq!(
+            callback_code(
+                on_play(
+                    State(state.clone()),
+                    Json(play_body(
+                        &room.stream_id,
+                        format!("?ticket={viewer_b_ticket}"),
+                        "client-c",
+                    )),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count(&room.stream_id).await, 2);
+        assert_eq!(
+            events.try_recv().expect("second viewer count event"),
+            crate::live_hub::RoomEvent::ViewerCount { count: 2 }
+        );
+
+        assert_eq!(
+            callback_code(
+                on_stop(
+                    State(state.clone()),
+                    Json(StopBody {
+                        action: "on_stop".to_string(),
+                        app: "live".to_string(),
+                        stream: room.stream_id.clone(),
+                        param: String::new(),
+                        vhost: "__defaultVhost__".to_string(),
+                        client_id: "client-a".to_string(),
+                    }),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count(&room.stream_id).await, 2);
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+
+        assert_eq!(
+            callback_code(
+                on_stop(
+                    State(state.clone()),
+                    Json(StopBody {
+                        action: "on_stop".to_string(),
+                        app: "live".to_string(),
+                        stream: room.stream_id.clone(),
+                        param: String::new(),
+                        vhost: "__defaultVhost__".to_string(),
+                        client_id: "client-b".to_string(),
+                    }),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count(&room.stream_id).await, 1);
+        assert_eq!(
+            events.try_recv().expect("last viewer reference stop event"),
+            crate::live_hub::RoomEvent::ViewerCount { count: 1 }
+        );
+
+        for client_id in ["unknown", "client-b"] {
+            assert_eq!(
+                callback_code(
+                    on_stop(
+                        State(state.clone()),
+                        Json(StopBody {
+                            action: "on_stop".to_string(),
+                            app: "live".to_string(),
+                            stream: room.stream_id.clone(),
+                            param: String::new(),
+                            vhost: "__defaultVhost__".to_string(),
+                            client_id: client_id.to_string(),
+                        }),
+                    )
+                    .await,
+                )
+                .await,
+                0
+            );
+            assert_eq!(hub.viewer_count(&room.stream_id).await, 1);
+            assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+        }
+
+        assert_eq!(
+            callback_code(
+                on_unpublish(
+                    State(state),
+                    Json(UnpublishBody {
+                        action: "on_unpublish".to_string(),
+                        app: "live".to_string(),
+                        stream: room.stream_id.clone(),
+                        param: String::new(),
+                        vhost: "__defaultVhost__".to_string(),
+                        client_id: "publisher".to_string(),
+                    }),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count(&room.stream_id).await, 0);
+        assert_eq!(
+            events.try_recv().expect("unpublish clears viewer count"),
+            crate::live_hub::RoomEvent::ViewerCount { count: 0 }
+        );
+    }
+
+    #[tokio::test]
+    async fn on_unpublish_clears_viewers_when_database_updates_fail() {
+        let hub = Arc::new(LiveHub::new());
+        let (_, mut events) = hub.subscribe("room-one").await;
+        hub.play(
+            "room-one",
+            "client-a",
+            "guest:00000000-0000-0000-0000-000000000001",
+        )
+        .await;
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("viewer count event before unpublish"),
+            crate::live_hub::RoomEvent::ViewerCount { count: 1 }
+        );
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_exec_errors([
+                DbErr::Custom("live session update failed".to_string()),
+                DbErr::Custom("stream state update failed".to_string()),
+            ])
+            .into_connection();
+
+        assert_eq!(
+            callback_code(
+                on_unpublish(
+                    State(test_state_with_hub(db, hub.clone())),
+                    Json(UnpublishBody {
+                        action: "on_unpublish".to_string(),
+                        app: "live".to_string(),
+                        stream: "room-one".to_string(),
+                        param: String::new(),
+                        vhost: "__defaultVhost__".to_string(),
+                        client_id: "publisher".to_string(),
+                    }),
+                )
+                .await,
+            )
+            .await,
+            0
+        );
+        assert_eq!(hub.viewer_count("room-one").await, 0);
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("unpublish broadcasts zero after database errors"),
+            crate::live_hub::RoomEvent::ViewerCount { count: 0 }
+        );
     }
 
     #[tokio::test]

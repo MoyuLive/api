@@ -1,14 +1,18 @@
 mod auth;
 mod config;
+mod danmaku;
 mod db;
 mod entities;
 mod handlers;
+mod live_hub;
 mod response;
+mod room_access;
+mod room_privacy;
 mod srs_client;
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, MatchedPath, State},
     http::{header, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -20,17 +24,19 @@ use percent_encoding::percent_decode_str;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
-use tracing::info;
+use tracing::{info, info_span};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::auth::JwtSecret;
 use crate::entities::user;
+use crate::live_hub::LiveHub;
 use crate::srs_client::SrsClient;
 
 pub struct AppState {
     pub db: DatabaseConnection,
     pub config: Arc<config::AppConfig>,
     pub srs_client: Arc<SrsClient>,
+    pub live_hub: Arc<LiveHub>,
 }
 
 // JWT auth middleware - validates Bearer token and injects CurrentUser
@@ -245,6 +251,7 @@ async fn main() {
         db,
         config: cfg.clone(),
         srs_client,
+        live_hub: Arc::new(LiveHub::new()),
     });
 
     // Public routes (no auth required)
@@ -252,6 +259,15 @@ async fn main() {
         .route("/api/account/create", post(handlers::account::create))
         .route("/api/account/login", post(handlers::account::login))
         .route("/api/live/rooms", get(handlers::live::public_live_rooms))
+        .route("/api/live/rooms/:stream_id", get(handlers::room::metadata))
+        .route(
+            "/api/live/rooms/:stream_id/ws",
+            get(handlers::room::websocket),
+        )
+        .route(
+            "/api/live/rooms/:stream_id/access",
+            post(handlers::room::access),
+        )
         .route("/feeds/live.xml", get(handlers::live_feed::live_rss_feed))
         .route(
             "/feeds/live/:stream_id",
@@ -362,6 +378,10 @@ async fn main() {
             put(handlers::live::update_room_title_by_id),
         )
         .route(
+            "/api/live/rooms/:id/privacy",
+            put(handlers::room::update_owned_privacy),
+        )
+        .route(
             "/api/live/rooms/:id/stream-code/reset",
             post(handlers::live::reset_stream_code_by_id),
         )
@@ -429,7 +449,16 @@ async fn main() {
         .merge(protected_routes)
         .nest_service("/uploads", ServeDir::new(uploads_dir))
         .layer(cors_layer)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                let matched_path = request
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .map(MatchedPath::as_str)
+                    .unwrap_or("unmatched");
+                info_span!("http_request", method = %request.method(), matched_path)
+            }),
+        )
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", cfg.http_port);

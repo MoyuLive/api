@@ -291,6 +291,9 @@ mod tests {
             cover_url: String::new(),
             stream_code: "stream-code".to_string(),
             enabled: true,
+            require_login: false,
+            password_hash: String::new(),
+            access_revision: 0,
             created_at: timestamp("2026-06-04 00:00:00"),
             updated_at: timestamp("2026-06-04 00:00:00"),
         }
