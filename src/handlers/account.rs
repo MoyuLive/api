@@ -14,7 +14,19 @@ use crate::entities::{live_room, user};
 use crate::response::{error_response, success_response};
 use crate::AppState;
 
-const REGISTRATION_ADVISORY_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(521351665736640)";
+pub(crate) const REGISTRATION_ADVISORY_LOCK_SQL: &str =
+    "SELECT pg_advisory_xact_lock(521351665736640)";
+
+enum RegistrationError {
+    DuplicateUsername,
+    Database(sea_orm::DbErr),
+}
+
+impl From<sea_orm::DbErr> for RegistrationError {
+    fn from(err: sea_orm::DbErr) -> Self {
+        RegistrationError::Database(err)
+    }
+}
 
 #[allow(clippy::result_large_err)]
 pub(crate) fn validate_username(username: &str) -> Result<(), (StatusCode, Response)> {
@@ -111,6 +123,14 @@ pub async fn create(
         .await?;
 
         let existing_users = user::Entity::find().count(&txn).await?;
+        let duplicate = user::Entity::find()
+            .filter(user::Column::Username.eq(&req.username))
+            .one(&txn)
+            .await?
+            .is_some();
+        if duplicate {
+            return Err(RegistrationError::DuplicateUsername);
+        }
         let (role, create_default_room) = registration_defaults(existing_users);
         let user = user::ActiveModel {
             username: Set(req.username.clone()),
@@ -135,24 +155,32 @@ pub async fn create(
             .await?;
         }
 
-        Ok::<_, sea_orm::DbErr>(created_user)
+        Ok::<_, RegistrationError>(created_user)
     }
     .await;
 
     let created_user = match created_user {
         Ok(created_user) => created_user,
         Err(e) => {
-            error!("Failed to create user: {}", e);
             if let Err(rollback_error) = txn.rollback().await {
                 error!(
                     "Failed to roll back create user transaction: {}",
                     rollback_error
                 );
             }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_response(500, "server save user failed"),
-            );
+            return match e {
+                RegistrationError::DuplicateUsername => (
+                    StatusCode::BAD_REQUEST,
+                    error_response(400, "username already exists"),
+                ),
+                RegistrationError::Database(e) => {
+                    error!("Failed to create user: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_response(500, "server save user failed"),
+                    )
+                }
+            };
         }
     };
 
@@ -533,6 +561,87 @@ mod tests {
             .await
             .expect("isolated test database should be dropped");
         result.expect("concurrent registration contract should hold");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
+    async fn duplicate_registration_is_rejected_with_bad_request() {
+        let Ok(base_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
+            eprintln!("skipping postgres registration test; YANTUBE_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let database_name = format!(
+            "yantube_duplicate_test_{}",
+            generate_random_string(16).to_ascii_lowercase()
+        );
+        let admin_url = database_url_for_name(&base_url, "postgres");
+        let test_url = database_url_for_name(&base_url, &database_name);
+        let admin = Database::connect(&admin_url)
+            .await
+            .expect("Postgres admin database should be reachable");
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE \"{database_name}\""))
+            .await
+            .expect("isolated test database should be created");
+
+        let result =
+            async {
+                let db = Database::connect(&test_url).await.map_err(|error| {
+                    format!("isolated test database should be reachable: {error}")
+                })?;
+                run_bundled_migrations(&db)
+                    .await
+                    .map_err(|error| format!("bundled migrations should succeed: {error}"))?;
+
+                let request = || CreateUserRequest {
+                    username: "duplicate_account".to_string(),
+                    password: "password1".to_string(),
+                };
+                let first_state =
+                    registration_test_state(Database::connect(&test_url).await.map_err(
+                        |error| format!("first connection should be reachable: {error}"),
+                    )?);
+                let first = create(State(first_state), Json(request()))
+                    .await
+                    .into_response()
+                    .status();
+                if first != StatusCode::OK {
+                    return Err(format!("the first registration must succeed, got {first}"));
+                }
+
+                let second_state =
+                    registration_test_state(Database::connect(&test_url).await.map_err(
+                        |error| format!("second connection should be reachable: {error}"),
+                    )?);
+                let second = create(State(second_state), Json(request()))
+                    .await
+                    .into_response()
+                    .status();
+                if second != StatusCode::BAD_REQUEST {
+                    return Err(format!(
+                        "a duplicate registration must be rejected with 400, got {second}"
+                    ));
+                }
+
+                let user_count = user::Entity::find()
+                    .count(&db)
+                    .await
+                    .map_err(|error| format!("users should be queryable: {error}"))?;
+                if user_count != 1 {
+                    return Err(format!(
+                        "the duplicate registration must not create a user, found {user_count}"
+                    ));
+                }
+
+                Ok::<_, String>(())
+            }
+            .await;
+
+        admin
+            .execute_unprepared(&format!("DROP DATABASE \"{database_name}\" WITH (FORCE)"))
+            .await
+            .expect("isolated test database should be dropped");
+        result.expect("duplicate registration contract should hold");
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@ use axum::{
 };
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
@@ -15,7 +15,9 @@ use tracing::{error, info};
 
 use crate::auth::{generate_random_string, hash_password, normalize_role, CurrentUser};
 use crate::entities::{live_room, live_session, live_stream_state, user};
-use crate::handlers::account::{validate_password, validate_username};
+use crate::handlers::account::{
+    validate_password, validate_username, REGISTRATION_ADVISORY_LOCK_SQL,
+};
 use crate::handlers::live::normalize_room_title;
 use crate::response::{error_response, success_response};
 use crate::room_access::{prepare_privacy_update, RoomAccessError, RoomPrivacyInput};
@@ -379,9 +381,35 @@ pub async fn create_user(
         return (StatusCode::BAD_REQUEST, error_response(400, "invalid role"));
     };
 
+    let stream_code = generate_random_string(16);
+    let txn = match state.db.begin().await {
+        Ok(txn) => txn,
+        Err(e) => {
+            error!("Failed to begin create admin user transaction: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_response(500, "failed to create user"),
+            );
+        }
+    };
+
+    if let Err(e) = txn
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            REGISTRATION_ADVISORY_LOCK_SQL.to_string(),
+        ))
+        .await
+    {
+        error!("Failed to lock user registration: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_response(500, "failed to create user"),
+        );
+    }
+
     match user::Entity::find()
         .filter(user::Column::Username.eq(&req.username))
-        .one(&state.db)
+        .one(&txn)
         .await
     {
         Ok(Some(_)) => {
@@ -399,18 +427,6 @@ pub async fn create_user(
             );
         }
     }
-
-    let stream_code = generate_random_string(16);
-    let txn = match state.db.begin().await {
-        Ok(txn) => txn,
-        Err(e) => {
-            error!("Failed to begin create admin user transaction: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_response(500, "failed to create user"),
-            );
-        }
-    };
 
     let active = user::ActiveModel {
         username: Set(req.username.clone()),
@@ -866,7 +882,7 @@ pub async fn create_room(
         enabled: Set(enabled.unwrap_or(true)),
         require_login: Set(privacy.require_login),
         password_hash: Set(privacy.password_hash),
-        access_revision: Set(0),
+        access_revision: Set(privacy.access_revision),
         ..Default::default()
     };
 

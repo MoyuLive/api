@@ -84,11 +84,19 @@ where
             }
         };
 
-        let secret = parts
-            .extensions
-            .get::<JwtSecret>()
-            .map(|s| s.0.as_str())
-            .unwrap_or("");
+        let secret = match parts.extensions.get::<JwtSecret>() {
+            Some(s) => s.0.as_str(),
+            None => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "code": 401,
+                        "msg": "invalid token",
+                        "data": null
+                    })),
+                ));
+            }
+        };
 
         let claims = decode_jwt(token, secret).map_err(|_| {
             (
