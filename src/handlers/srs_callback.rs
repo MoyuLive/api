@@ -1,9 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use chrono::{Duration, NaiveDateTime, Utc};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    Set,
-};
+use chrono::{NaiveDateTime, Utc};
+use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -258,6 +255,7 @@ async fn matching_forward_rules(
         .await
 }
 
+#[cfg(test)]
 fn next_episode_started_at(
     previous: Option<&live_stream_state::Model>,
     now: NaiveDateTime,
@@ -274,7 +272,7 @@ fn next_episode_started_at(
         return now;
     };
 
-    if now - last_unpublished_at <= Duration::seconds(LIVE_RECONNECT_GRACE_SECONDS) {
+    if now - last_unpublished_at <= chrono::Duration::seconds(LIVE_RECONNECT_GRACE_SECONDS) {
         previous.episode_started_at
     } else {
         now
@@ -287,33 +285,43 @@ async fn mark_live_stream_published(
     user_id: i32,
     now: NaiveDateTime,
 ) -> Result<(), DbErr> {
-    let previous = live_stream_state::Entity::find()
-        .filter(live_stream_state::Column::StreamId.eq(stream_id))
-        .one(db)
-        .await?;
-    let episode_started_at = next_episode_started_at(previous.as_ref(), now);
-
-    if let Some(previous) = previous {
-        let mut active: live_stream_state::ActiveModel = previous.into();
-        active.user_id = Set(user_id);
-        active.status = Set("active".to_string());
-        active.episode_started_at = Set(episode_started_at);
-        active.last_unpublished_at = Set(None);
-        active.updated_at = Set(now);
-        active.update(db).await?;
-        return Ok(());
-    }
-
     let state = live_stream_state::ActiveModel {
         stream_id: Set(stream_id.to_string()),
         user_id: Set(user_id),
         status: Set("active".to_string()),
-        episode_started_at: Set(episode_started_at),
+        episode_started_at: Set(now),
         last_unpublished_at: Set(None),
         updated_at: Set(now),
         ..Default::default()
     };
-    state.insert(db).await?;
+    live_stream_state::Entity::insert(state)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(live_stream_state::Column::StreamId)
+                .update_columns([
+                    live_stream_state::Column::UserId,
+                    live_stream_state::Column::Status,
+                    live_stream_state::Column::LastUnpublishedAt,
+                    live_stream_state::Column::UpdatedAt,
+                ])
+                .value(
+                    live_stream_state::Column::EpisodeStartedAt,
+                    sea_orm::sea_query::Expr::cust(format!(
+                        "CASE \
+                         WHEN \"live_stream_state\".\"status\" = 'active' \
+                         THEN \"live_stream_state\".\"episode_started_at\" \
+                         WHEN \"live_stream_state\".\"last_unpublished_at\" IS NOT NULL \
+                         AND \"excluded\".\"episode_started_at\" - \
+                         \"live_stream_state\".\"last_unpublished_at\" \
+                         <= INTERVAL '{} seconds' \
+                         THEN \"live_stream_state\".\"episode_started_at\" \
+                         ELSE \"excluded\".\"episode_started_at\" END",
+                        LIVE_RECONNECT_GRACE_SECONDS
+                    )),
+                )
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
     Ok(())
 }
 
@@ -641,43 +649,33 @@ pub async fn heartbeat(
 ) -> impl IntoResponse {
     let now = chrono::Utc::now().naive_utc();
 
-    // Try to find existing server, upsert
-    let existing = srs_server::Entity::find()
-        .filter(srs_server::Column::DeviceId.eq(&body.device_id))
-        .one(&state.db)
-        .await;
-
-    match existing {
-        Ok(Some(existing_server)) => {
-            let mut active: srs_server::ActiveModel = existing_server.into();
-            active.ip = Set(body.ip);
-            active.last_heartbeat = Set(now);
-            active.is_active = Set(body.is_active);
-            active.cpu_usage = Set(body.cpu_usage as f32);
-            active.mem_usage = Set(body.mem_usage as f32);
-            active.uptime_seconds = Set(body.uptime_seconds);
-            if let Err(e) = active.update(&state.db).await {
-                error!("heartbeat: failed to update srs server: {}", e);
-            }
-        }
-        Ok(None) => {
-            let server = srs_server::ActiveModel {
-                device_id: Set(body.device_id),
-                ip: Set(body.ip),
-                last_heartbeat: Set(now),
-                is_active: Set(body.is_active),
-                cpu_usage: Set(body.cpu_usage as f32),
-                mem_usage: Set(body.mem_usage as f32),
-                uptime_seconds: Set(body.uptime_seconds),
-                ..Default::default()
-            };
-            if let Err(e) = server.insert(&state.db).await {
-                error!("heartbeat: failed to insert srs server: {}", e);
-            }
-        }
-        Err(e) => {
-            error!("heartbeat: db query error: {}", e);
-        }
+    let server = srs_server::ActiveModel {
+        device_id: Set(body.device_id),
+        ip: Set(body.ip),
+        last_heartbeat: Set(now),
+        is_active: Set(body.is_active),
+        cpu_usage: Set(body.cpu_usage as f32),
+        mem_usage: Set(body.mem_usage as f32),
+        uptime_seconds: Set(body.uptime_seconds),
+        ..Default::default()
+    };
+    if let Err(e) = srs_server::Entity::insert(server)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(srs_server::Column::DeviceId)
+                .update_columns([
+                    srs_server::Column::Ip,
+                    srs_server::Column::LastHeartbeat,
+                    srs_server::Column::IsActive,
+                    srs_server::Column::CpuUsage,
+                    srs_server::Column::MemUsage,
+                    srs_server::Column::UptimeSeconds,
+                ])
+                .to_owned(),
+        )
+        .exec(&state.db)
+        .await
+    {
+        error!("heartbeat: failed to upsert srs server: {}", e);
     }
 
     (
@@ -694,8 +692,10 @@ mod tests {
     use super::*;
     use axum::{body::to_bytes, response::IntoResponse};
     use chrono::NaiveDateTime;
-    use sea_orm::{DbBackend, MockDatabase, MockExecResult};
+    use sea_orm::{ConnectionTrait, Database, DbBackend, MockDatabase, MockExecResult};
+    use tokio::sync::Barrier;
 
+    use crate::auth::generate_random_string;
     use crate::config::{
         AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig,
         StorageConfig, UserConfig,
@@ -1399,5 +1399,272 @@ mod tests {
         let started_at = next_episode_started_at(Some(&previous), now);
 
         assert_eq!(started_at, now);
+    }
+
+    #[tokio::test]
+    async fn publishing_a_stream_state_uses_existing_row_in_atomic_conflict_update() {
+        let previous = live_state("ended", "2026-06-04 12:00:00", Some("2026-06-04 12:03:00"));
+        let now =
+            NaiveDateTime::parse_from_str("2026-06-04 12:05:00", "%F %T").expect("valid timestamp");
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[previous.clone()], [previous]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        mark_live_stream_published(&db, "dawu", 1, now)
+            .await
+            .expect("upsert succeeds");
+
+        let statements = db.into_transaction_log();
+        assert_eq!(
+            statements.len(),
+            1,
+            "unexpected statements: {statements:#?}"
+        );
+        let statement = statements.first().expect("upsert statement recorded");
+        let sql = format!("{:#?}", statement);
+        assert!(sql.contains("ON CONFLICT"), "unexpected sql: {sql}");
+        assert!(
+            sql.contains(r#"\"episode_started_at\" = CASE"#),
+            "unexpected sql: {sql}"
+        );
+        assert!(
+            sql.contains(r#"\"live_stream_state\".\"status\" = 'active'"#),
+            "unexpected sql: {sql}"
+        );
+        assert!(
+            sql.contains(r#"\"live_stream_state\".\"last_unpublished_at\" IS NOT NULL"#),
+            "unexpected sql: {sql}"
+        );
+        assert!(
+            sql.contains("INTERVAL '600 seconds'"),
+            "unexpected sql: {sql}"
+        );
+        assert!(
+            sql.contains(r#"ELSE \"excluded\".\"episode_started_at\" END"#),
+            "unexpected sql: {sql}"
+        );
+        assert!(
+            !sql.contains(r#"\"episode_started_at\" = \"excluded\".\"episode_started_at\""#),
+            "unexpected sql: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
+    async fn publishing_a_stream_state_preserves_episode_start_concurrently_in_postgres() {
+        let Ok(base_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
+            eprintln!("skipping postgres stream state test; YANTUBE_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let suffix = generate_random_string(16).to_ascii_lowercase();
+        let database_name = format!("yantube_stream_state_test_{suffix}");
+        let database_url_for_name = |database_name: &str| {
+            let mut url = url::Url::parse(&base_url).expect("test database URL must be a URL");
+            url.set_path(&format!("/{database_name}"));
+            url.to_string()
+        };
+        let admin_url = database_url_for_name("postgres");
+        let test_url = database_url_for_name(&database_name);
+        let admin = Database::connect(&admin_url)
+            .await
+            .expect("Postgres admin database should be reachable");
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE \"{database_name}\""))
+            .await
+            .expect("isolated test database should be created");
+
+        let result = async {
+            let migration_url = test_url.clone();
+            let db = Arc::new(
+                tokio::spawn(async move { crate::db::init_db(&migration_url).await })
+                    .await
+                    .map_err(|error| format!("bundled migrations should succeed: {error}"))?,
+            );
+            let user_id = user::Entity::insert(user::ActiveModel {
+                username: Set(format!("stream_state_{suffix}")),
+                password: Set("test-password".to_string()),
+                ..Default::default()
+            })
+            .exec(db.as_ref())
+            .await
+            .map_err(|error| format!("stream state test user should be created: {error}"))?
+            .last_insert_id;
+            let stream_id = format!("postgres-stream-state-{suffix}");
+            let first_now = NaiveDateTime::parse_from_str("2026-06-04 12:00:00", "%F %T")
+                .expect("valid first publish timestamp");
+            let second_now = NaiveDateTime::parse_from_str("2026-06-04 12:01:00", "%F %T")
+                .expect("valid second publish timestamp");
+            let barrier = Arc::new(Barrier::new(2));
+            let first_db = db.clone();
+            let first_barrier = barrier.clone();
+            let first_stream_id = stream_id.clone();
+            let first = async move {
+                first_barrier.wait().await;
+                mark_live_stream_published(
+                    first_db.as_ref(),
+                    &first_stream_id,
+                    user_id,
+                    first_now,
+                )
+                .await
+            };
+            let second_db = db.clone();
+            let second_stream_id = stream_id.clone();
+            let second = async move {
+                barrier.wait().await;
+                mark_live_stream_published(
+                    second_db.as_ref(),
+                    &second_stream_id,
+                    user_id,
+                    second_now,
+                )
+                .await
+            };
+            let (first_result, second_result) = tokio::join!(first, second);
+            first_result
+                .map_err(|error| format!("first concurrent publish should succeed: {error}"))?;
+            second_result
+                .map_err(|error| format!("second concurrent publish should succeed: {error}"))?;
+
+            let state = live_stream_state::Entity::find()
+                .filter(live_stream_state::Column::StreamId.eq(&stream_id))
+                .one(db.as_ref())
+                .await
+                .map_err(|error| format!("concurrent stream state should be queryable: {error}"))?
+                .ok_or_else(|| "concurrent stream state should exist".to_string())?;
+            let concurrent_times = [first_now, second_now];
+            if state.status != "active"
+                || state.episode_started_at == state.updated_at
+                || !concurrent_times.contains(&state.episode_started_at)
+                || !concurrent_times.contains(&state.updated_at)
+            {
+                return Err(format!(
+                    "concurrent publishes must preserve the insert timestamp while updating the conflict timestamp, got {state:?}"
+                ));
+            }
+            let original_episode_started_at = state.episode_started_at;
+
+            let active_republish_at = NaiveDateTime::parse_from_str("2026-06-04 12:02:00", "%F %T")
+                .expect("valid active republish timestamp");
+            mark_live_stream_published(db.as_ref(), &stream_id, user_id, active_republish_at)
+                .await
+                .map_err(|error| format!("active republish should succeed: {error}"))?;
+            let state = live_stream_state::Entity::find()
+                .filter(live_stream_state::Column::StreamId.eq(&stream_id))
+                .one(db.as_ref())
+                .await
+                .map_err(|error| format!("active republish state should be queryable: {error}"))?
+                .ok_or_else(|| "active republish state should exist".to_string())?;
+            if state.status != "active"
+                || state.episode_started_at != original_episode_started_at
+                || state.updated_at != active_republish_at
+            {
+                return Err(format!(
+                    "active republish must preserve the episode start, got {state:?}"
+                ));
+            }
+
+            let boundary_unpublish_at =
+                NaiveDateTime::parse_from_str("2026-06-04 12:10:00", "%F %T")
+                    .expect("valid boundary unpublish timestamp");
+            let boundary_republish_at =
+                boundary_unpublish_at + chrono::Duration::seconds(LIVE_RECONNECT_GRACE_SECONDS);
+            mark_live_stream_unpublished(db.as_ref(), &stream_id, boundary_unpublish_at)
+                .await
+                .map_err(|error| format!("boundary unpublish should succeed: {error}"))?;
+            mark_live_stream_published(db.as_ref(), &stream_id, user_id, boundary_republish_at)
+                .await
+                .map_err(|error| format!("boundary republish should succeed: {error}"))?;
+            let state = live_stream_state::Entity::find()
+                .filter(live_stream_state::Column::StreamId.eq(&stream_id))
+                .one(db.as_ref())
+                .await
+                .map_err(|error| format!("boundary republish state should be queryable: {error}"))?
+                .ok_or_else(|| "boundary republish state should exist".to_string())?;
+            if state.status != "active"
+                || state.episode_started_at != original_episode_started_at
+                || state.updated_at != boundary_republish_at
+            {
+                return Err(format!(
+                    "a republish at the reconnect boundary must preserve the episode start, got {state:?}"
+                ));
+            }
+
+            let after_grace_unpublish_at =
+                NaiveDateTime::parse_from_str("2026-06-04 12:30:00", "%F %T")
+                    .expect("valid after-grace unpublish timestamp");
+            let after_grace_republish_at = after_grace_unpublish_at
+                + chrono::Duration::seconds(LIVE_RECONNECT_GRACE_SECONDS + 1);
+            mark_live_stream_unpublished(db.as_ref(), &stream_id, after_grace_unpublish_at)
+                .await
+                .map_err(|error| format!("after-grace unpublish should succeed: {error}"))?;
+            mark_live_stream_published(
+                db.as_ref(),
+                &stream_id,
+                user_id,
+                after_grace_republish_at,
+            )
+                .await
+                .map_err(|error| format!("after-grace republish should succeed: {error}"))?;
+            let state = live_stream_state::Entity::find()
+                .filter(live_stream_state::Column::StreamId.eq(&stream_id))
+                .one(db.as_ref())
+                .await
+                .map_err(|error| format!("after-grace republish state should be queryable: {error}"))?
+                .ok_or_else(|| "after-grace republish state should exist".to_string())?;
+            if state.status != "active"
+                || state.episode_started_at != after_grace_republish_at
+                || state.updated_at != after_grace_republish_at
+            {
+                return Err(format!(
+                    "a republish after the reconnect grace period must start a new episode, got {state:?}"
+                ));
+            }
+
+            Ok::<_, String>(())
+        }
+        .await;
+
+        admin
+            .execute_unprepared(&format!("DROP DATABASE \"{database_name}\" WITH (FORCE)"))
+            .await
+            .expect("isolated test database should be dropped");
+        result.expect("PostgreSQL stream state publishing contract should hold");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_upserts_on_conflict() {
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_exec_results([MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let state = test_state(db);
+
+        heartbeat(
+            State(state.clone()),
+            Json(HeartbeatBody {
+                device_id: "srs-1".to_string(),
+                ip: "127.0.0.1".to_string(),
+                is_active: true,
+                cpu_usage: 0.5,
+                mem_usage: 0.25,
+                uptime_seconds: 42,
+            }),
+        )
+        .await;
+
+        let state = Arc::try_unwrap(state).unwrap_or_else(|_| panic!("state should be unique"));
+        let statements = state.db.into_transaction_log();
+        let insert = format!(
+            "{:?}",
+            statements.last().expect("insert statement recorded")
+        );
+        assert!(insert.contains("ON CONFLICT"), "unexpected sql: {insert}");
     }
 }
