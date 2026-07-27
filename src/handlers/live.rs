@@ -675,6 +675,7 @@ pub struct StreamStatusQuery {
 // GET /api/live/stream/status
 pub async fn stream_status(
     State(state): State<Arc<AppState>>,
+    auth_user: CurrentUser,
     Query(query): Query<StreamStatusQuery>,
 ) -> impl IntoResponse {
     let stream_id = match query.stream {
@@ -686,6 +687,30 @@ pub async fn stream_status(
             );
         }
     };
+
+    if !auth_user.is_admin() {
+        let owned = live_room::Entity::find()
+            .filter(live_room::Column::StreamId.eq(&stream_id))
+            .filter(live_room::Column::UserId.eq(auth_user.user_id))
+            .one(&state.db)
+            .await;
+        match owned {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    error_response(403, "you can only query your own streams"),
+                );
+            }
+            Err(e) => {
+                error!("Failed to load live room for stream status: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_response(500, "failed to query stream status"),
+                );
+            }
+        }
+    }
 
     match state.srs_client.get_stream(&stream_id).await {
         Ok(Some(stream)) => (
@@ -731,6 +756,7 @@ pub async fn stop_stream(
     // Get the live session to find the client ID
     let session = live_session::Entity::find()
         .filter(live_session::Column::StreamId.eq(&req.stream_id))
+        .filter(live_session::Column::Status.eq("active"))
         .one(&state.db)
         .await;
 
@@ -1270,5 +1296,140 @@ mod tests {
     #[test]
     fn cover_image_extension_rejects_unknown_formats() {
         assert_eq!(cover_image_extension(b"not an image"), None);
+    }
+
+    fn mock_state(db: sea_orm::DatabaseConnection) -> Arc<AppState> {
+        use crate::config::{
+            AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig,
+            StorageConfig, UserConfig,
+        };
+        use crate::live_hub::LiveHub;
+        use crate::srs_client::SrsClient;
+
+        Arc::new(AppState {
+            db,
+            config: Arc::new(AppConfig {
+                http_port: 9081,
+                db: DbConfig {
+                    dsn: "mock".to_string(),
+                },
+                user: UserConfig {
+                    allow_register: false,
+                    auth_realm: "stream api".to_string(),
+                    auth_secret: "test-secret".to_string(),
+                },
+                srs: SrsConfig {
+                    api_url: "http://srs:1985".to_string(),
+                    api_user: "admin".to_string(),
+                    api_password: "password".to_string(),
+                    callback_secret: "callback-secret".to_string(),
+                },
+                playback: PlaybackConfig {
+                    protocols: "flv".to_string(),
+                },
+                publish: PublishConfig {
+                    protocols: "rtmp".to_string(),
+                },
+                storage: StorageConfig {
+                    upload_dir: "uploads-test".to_string(),
+                },
+                metrics: MetricsConfig { enabled: false },
+                cors_origins: vec!["http://localhost:5173".to_string()],
+            }),
+            srs_client: Arc::new(SrsClient::new(
+                "http://srs:1985".to_string(),
+                "admin".to_string(),
+                "password".to_string(),
+            )),
+            live_hub: Arc::new(LiveHub::new()),
+        })
+    }
+
+    fn viewer(user_id: i32, role: &str) -> CurrentUser {
+        CurrentUser {
+            username: format!("user-{}", user_id),
+            user_id,
+            role: role.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_status_rejects_users_who_do_not_own_the_stream() {
+        use sea_orm::{DbBackend, MockDatabase};
+
+        let state = mock_state(
+            MockDatabase::new(DbBackend::Postgres)
+                .append_query_results([Vec::<live_room::Model>::new()])
+                .into_connection(),
+        );
+
+        let response = stream_status(
+            State(state),
+            viewer(2, "user"),
+            Query(StreamStatusQuery {
+                stream: Some("dawu".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn stream_status_requires_a_stream_parameter() {
+        use sea_orm::{DbBackend, MockDatabase};
+
+        let state = mock_state(MockDatabase::new(DbBackend::Postgres).into_connection());
+
+        let response = stream_status(
+            State(state),
+            viewer(1, "admin"),
+            Query(StreamStatusQuery { stream: None }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn stop_stream_ignores_ended_sessions_and_authorizes_against_the_room() {
+        use sea_orm::{DbBackend, MockDatabase};
+
+        // An ended session owned by user 2 exists, but the active-session filter must skip it,
+        // so authorization falls through to the room, which is owned by user 1.
+        let state = mock_state(
+            MockDatabase::new(DbBackend::Postgres)
+                .append_query_results([Vec::<live_session::Model>::new()])
+                .append_query_results([vec![live_room_model("dawu", "大雾的游戏时间")]])
+                .into_connection(),
+        );
+
+        let response = stop_stream(
+            State(state.clone()),
+            viewer(2, "user"),
+            Json(StopStreamRequest {
+                stream_id: "dawu".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let state = Arc::try_unwrap(state).unwrap_or_else(|_| panic!("state should be unique"));
+        let session_query = format!(
+            "{:?}",
+            state
+                .db
+                .into_transaction_log()
+                .first()
+                .expect("the session lookup should be recorded")
+        );
+        assert!(
+            session_query.contains("\"active\""),
+            "the session lookup must bind the active status, got: {session_query}"
+        );
     }
 }

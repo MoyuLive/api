@@ -32,6 +32,8 @@ use crate::AppState;
 
 const MIN_PASSWORD_CHARS: usize = 6;
 const MAX_PASSWORD_CHARS: usize = 64;
+const WS_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Serialize)]
 pub struct PublicRoomMetadata {
@@ -276,14 +278,35 @@ async fn handle_websocket(
     }
 
     let mut rate_limiter = ConnectionRateLimiter::new();
+    let mut keepalive = tokio::time::interval(WS_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
+    let mut last_seen = Instant::now();
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if Utc::now().timestamp() >= claims.exp {
+                    close_room_access_denied(&mut socket).await;
+                    return;
+                }
+                if last_seen.elapsed() >= WS_IDLE_TIMEOUT {
+                    return;
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    return;
+                }
+            }
             incoming = socket.recv() => {
                 let Some(incoming) = incoming else {
                     return;
                 };
+                last_seen = Instant::now();
                 match incoming {
                     Ok(Message::Text(payload)) => {
+                        if Utc::now().timestamp() >= claims.exp {
+                            close_room_access_denied(&mut socket).await;
+                            return;
+                        }
                         let result = serde_json::from_str::<ClientMessage>(&payload)
                             .map_err(|_| DanmakuError::InvalidMessage)
                             .and_then(|message| match message {

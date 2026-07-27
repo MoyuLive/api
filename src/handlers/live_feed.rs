@@ -73,7 +73,11 @@ async fn live_feed_response(
             Ok(rooms) => rooms,
             Err(e) => {
                 error!("Failed to load live feed room metadata: {}", e);
-                Vec::new()
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to load live feed",
+                )
+                    .into_response();
             }
         }
     };
@@ -113,16 +117,17 @@ fn build_live_feed_items(
                 .unwrap_or(true)
         })
         .filter(|state| (now - state.updated_at).num_seconds() >= LIVE_FEED_MIN_LIVE_SECONDS)
-        .map(|state| {
-            let title = rooms_by_stream_id
-                .get(&state.stream_id)
-                .map(|room| live_room_title(&room.title, &state.stream_id))
-                .unwrap_or_else(|| state.stream_id.clone());
+        .filter_map(|state| {
+            let room = rooms_by_stream_id.get(&state.stream_id)?;
+            if !is_public_feed_room(room) {
+                return None;
+            }
+            let title = live_room_title(&room.title, &state.stream_id);
             let encoded_stream_id =
                 utf8_percent_encode(&state.stream_id, NON_ALPHANUMERIC).to_string();
             let episode_started_at =
                 DateTime::<Utc>::from_naive_utc_and_offset(state.episode_started_at, Utc);
-            LiveFeedItem {
+            Some(LiveFeedItem {
                 title: title.clone(),
                 link: format!(
                     "{}/live/{}",
@@ -137,7 +142,7 @@ fn build_live_feed_items(
                 pub_date: episode_started_at.to_rfc2822(),
                 description: format!("{} 正在直播", title),
                 started_at_ms: episode_started_at.timestamp_millis(),
-            }
+            })
         })
         .collect();
 
@@ -234,6 +239,10 @@ fn escape_xml(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn is_public_feed_room(room: &live_room::Model) -> bool {
+    room.enabled && !room.require_login && room.password_hash.trim().is_empty()
 }
 
 fn live_room_title(room_title: &str, fallback: &str) -> String {
@@ -389,5 +398,64 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "dawu的直播间");
         assert_eq!(items[0].description, "dawu的直播间 正在直播");
+    }
+
+    #[test]
+    fn feed_items_hide_private_and_disabled_rooms() {
+        let now = timestamp("2026-06-04 12:01:00");
+        let states = || {
+            vec![live_state_with_user_and_updated_at(
+                "dawu",
+                1,
+                "2026-06-04 12:00:00",
+                "2026-06-04 12:00:00",
+            )]
+        };
+
+        let mut login_only = live_room_model(1, "dawu", "大雾的游戏时间");
+        login_only.require_login = true;
+        assert!(build_live_feed_items(
+            states(),
+            vec![login_only],
+            now,
+            "https://live.example.test",
+            None
+        )
+        .is_empty());
+
+        let mut password_protected = live_room_model(1, "dawu", "大雾的游戏时间");
+        password_protected.password_hash = "sha256$32$100000$salt$hash".to_string();
+        assert!(build_live_feed_items(
+            states(),
+            vec![password_protected],
+            now,
+            "https://live.example.test",
+            None
+        )
+        .is_empty());
+
+        let mut disabled = live_room_model(1, "dawu", "大雾的游戏时间");
+        disabled.enabled = false;
+        assert!(build_live_feed_items(
+            states(),
+            vec![disabled],
+            now,
+            "https://live.example.test",
+            None
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn feed_items_skip_streams_without_a_known_room() {
+        let items = build_live_feed_items(
+            vec![live_state("ghost", "2026-06-04 12:00:00")],
+            vec![live_room_model(1, "dawu", "大雾的游戏时间")],
+            timestamp("2026-06-04 12:01:00"),
+            "https://live.example.test",
+            None,
+        );
+
+        assert!(items.is_empty());
     }
 }
