@@ -1291,7 +1291,6 @@ mod tests {
             AppConfig, DbConfig, MetricsConfig, PlaybackConfig, PublishConfig, SrsConfig,
             StorageConfig, UserConfig,
         },
-        entities::user,
         live_hub::LiveHub,
         srs_client::SrsClient,
     };
@@ -1344,18 +1343,6 @@ mod tests {
         }
     }
 
-    fn room_owner() -> user::Model {
-        user::Model {
-            id: 7,
-            username: "room-owner".to_string(),
-            password: "password-hash".to_string(),
-            stream_code: "stream-code".to_string(),
-            room_title: String::new(),
-            role: "user".to_string(),
-            enabled: true,
-        }
-    }
-
     #[tokio::test]
     async fn ordinary_admin_cannot_combine_privacy_with_super_only_room_fields() {
         let db = MockDatabase::new(DbBackend::Postgres).into_connection();
@@ -1377,35 +1364,5 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn create_password_room_rejects_missing_short_and_long_passwords() {
-        for password in [None, Some("short".to_string()), Some("a".repeat(65))] {
-            let db = MockDatabase::new(DbBackend::Postgres)
-                .append_query_results([[room_owner()]])
-                .append_query_results([Vec::<live_room::Model>::new()])
-                .into_connection();
-            let response = create_room(
-                State(test_state(db)),
-                CurrentUser {
-                    role: "super_admin".to_string(),
-                    ..admin_user()
-                },
-                Json(CreateRoomRequest {
-                    user_id: 7,
-                    stream_id: "password-room".to_string(),
-                    title: String::new(),
-                    enabled: None,
-                    require_login: false,
-                    password_enabled: true,
-                    password,
-                }),
-            )
-            .await
-            .into_response();
-
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
     }
 }

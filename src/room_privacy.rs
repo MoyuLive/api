@@ -131,16 +131,14 @@ mod tests {
 
     const TICKET_SECRET: &str = "room-privacy-postgres-test-secret";
 
-    async fn test_database() -> Option<(String, DatabaseConnection)> {
-        let Ok(database_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
-            eprintln!("skipping postgres room privacy test; YANTUBE_TEST_DATABASE_URL is not set");
-            return None;
-        };
+    async fn test_database() -> (String, DatabaseConnection) {
+        let database_url = std::env::var("YANTUBE_TEST_DATABASE_URL")
+            .expect("set YANTUBE_TEST_DATABASE_URL to run PostgreSQL tests");
 
         let db = Database::connect(&database_url)
             .await
             .expect("test database should be reachable");
-        Some((database_url, db))
+        (database_url, db)
     }
 
     async fn create_fixture(
@@ -189,11 +187,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PostgreSQL"]
+    #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn concurrent_privacy_updates_are_serialized() {
-        let Some((database_url, db)) = test_database().await else {
-            return;
-        };
+        let (database_url, db) = test_database().await;
         let room = create_fixture(&db, 11, String::new()).await;
         let barrier = Arc::new(Barrier::new(2));
         let room_id = room.id;
@@ -263,11 +259,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PostgreSQL"]
+    #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn each_committed_privacy_change_stales_the_previous_ticket() {
-        let Some((_database_url, db)) = test_database().await else {
-            return;
-        };
+        let (_database_url, db) = test_database().await;
         let room = create_fixture(&db, 23, String::new()).await;
 
         let result = async {
@@ -373,11 +367,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PostgreSQL"]
+    #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn locked_updates_preserve_clear_and_do_not_bump_unchanged_revisions() {
-        let Some((_database_url, db)) = test_database().await else {
-            return;
-        };
+        let (_database_url, db) = test_database().await;
         let room = create_fixture(&db, 31, crate::auth::hash_password("preserve-pass")).await;
 
         let result = async {

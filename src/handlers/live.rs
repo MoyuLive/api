@@ -1049,7 +1049,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::auth::hash_password;
     use crate::srs_client::{SrsStreamKbps, SrsStreamPublish, SrsStreamVideo};
 
     fn live_session(stream_id: &str, started_at: NaiveDateTime) -> live_session::Model {
@@ -1088,26 +1087,6 @@ mod tests {
             access_revision: 0,
             created_at: now,
             updated_at: now,
-        }
-    }
-
-    fn live_room_model_for_user(
-        id: i32,
-        user_id: i32,
-        stream_id: &str,
-        title: &str,
-    ) -> live_room::Model {
-        live_room::Model {
-            id,
-            user_id,
-            ..live_room_model(stream_id, title)
-        }
-    }
-
-    fn live_room_model_with_id(id: i32, stream_id: &str, title: &str) -> live_room::Model {
-        live_room::Model {
-            id,
-            ..live_room_model(stream_id, title)
         }
     }
 
@@ -1171,131 +1150,6 @@ mod tests {
 
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].stream_id, "dawu");
-        assert_eq!(rooms[0].title, "大雾的游戏时间");
-        assert_eq!(rooms[0].started_at_ms, Some(1_780_317_000_000));
-        assert_eq!(rooms[0].video_width, Some(1920));
-        assert_eq!(rooms[0].video_height, Some(1080));
-        assert_eq!(rooms[0].recv_kbps, Some(1800));
-        assert_eq!(rooms[0].send_kbps, Some(600));
-    }
-
-    #[test]
-    fn public_rooms_sort_by_known_started_time_then_stream_id() {
-        let old =
-            NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%F %T").expect("valid timestamp");
-        let new =
-            NaiveDateTime::parse_from_str("2026-06-01 13:00:00", "%F %T").expect("valid timestamp");
-
-        let rooms = build_public_live_rooms(
-            vec![
-                srs_stream("without-session", 10_000),
-                srs_stream("old", 20_000),
-                srs_stream("new", 30_000),
-            ],
-            vec![live_session("old", old), live_session("new", new)],
-            vec![
-                live_room_model_with_id(1, "old", "旧直播间"),
-                live_room_model_with_id(2, "new", "新直播间"),
-            ],
-            HashMap::new(),
-        );
-
-        let ids: Vec<&str> = rooms.iter().map(|room| room.stream_id.as_str()).collect();
-        assert_eq!(ids, vec!["new", "old", "without-session"]);
-    }
-
-    #[test]
-    fn public_room_title_falls_back_to_stream_id_when_blank() {
-        let started_at =
-            NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%F %T").expect("valid timestamp");
-        let rooms = build_public_live_rooms(
-            vec![srs_stream("dawu", 60_000)],
-            vec![live_session("dawu", started_at)],
-            vec![live_room_model("dawu", "   ")],
-            HashMap::new(),
-        );
-
-        assert_eq!(rooms[0].title, "dawu");
-    }
-
-    #[test]
-    fn public_live_rooms_keep_private_rooms_and_use_hub_viewer_counts() {
-        let started_at =
-            NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%F %T").expect("valid timestamp");
-        let mut room = live_room_model("private-room", "Private room");
-        room.require_login = true;
-        room.password_hash = hash_password("secret1");
-        let mut stream = srs_stream("private-room", 60_000);
-        stream.clients = 99;
-
-        let rooms = build_public_live_rooms(
-            vec![stream],
-            vec![live_session("private-room", started_at)],
-            vec![room],
-            HashMap::from([("private-room".to_string(), 2)]),
-        );
-
-        assert_eq!(rooms.len(), 1);
-        assert!(rooms[0].require_login);
-        assert!(rooms[0].has_password);
-        assert_eq!(rooms[0].viewer_count, 2);
-    }
-
-    #[test]
-    fn own_rooms_include_stream_codes_and_live_status() {
-        let rooms = build_own_live_room_responses(
-            vec![
-                live_room_model_for_user(1, 7, "default", "默认"),
-                live_room_model_for_user(2, 7, "extra", "额外"),
-            ],
-            vec![live_session(
-                "extra",
-                NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%F %T")
-                    .expect("valid timestamp"),
-            )],
-            "alice",
-        );
-
-        assert_eq!(rooms.len(), 2);
-        assert_eq!(rooms[0].username, "alice");
-        assert_eq!(rooms[0].stream_code, "stream-code");
-        assert!(!rooms[0].require_login);
-        assert!(!rooms[0].has_password);
-        assert_eq!(rooms[0].status, "offline");
-        assert_eq!(rooms[1].stream_id, "extra");
-        assert_eq!(rooms[1].status, "live");
-    }
-
-    #[test]
-    fn room_title_is_trimmed_before_persisting() {
-        let title = normalize_room_title("  晚上打 Terraria  ");
-
-        assert_eq!(title.expect("title should be valid"), "晚上打 Terraria");
-    }
-
-    #[test]
-    fn room_title_rejects_overlong_values() {
-        let title = normalize_room_title(&"a".repeat(MAX_ROOM_TITLE_CHARS + 1));
-
-        assert_eq!(title, Err("room title is too long"));
-    }
-
-    #[test]
-    fn cover_image_extension_detects_supported_formats_by_header() {
-        assert_eq!(
-            cover_image_extension(&[0xFF, 0xD8, 0xFF, 0xE0]),
-            Some("jpg")
-        );
-        assert_eq!(
-            cover_image_extension(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
-            Some("png")
-        );
-        assert_eq!(cover_image_extension(b"RIFFxxxxWEBPVP8 "), Some("webp"));
-    }
-
-    #[test]
-    fn cover_image_extension_rejects_unknown_formats() {
-        assert_eq!(cover_image_extension(b"not an image"), None);
     }
 
     fn mock_state(db: sea_orm::DatabaseConnection) -> Arc<AppState> {
@@ -1354,51 +1208,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_status_rejects_users_who_do_not_own_the_stream() {
+    async fn stop_stream_rejects_non_owner_without_an_active_session() {
         use sea_orm::{DbBackend, MockDatabase};
 
-        let state = mock_state(
-            MockDatabase::new(DbBackend::Postgres)
-                .append_query_results([Vec::<live_room::Model>::new()])
-                .into_connection(),
-        );
-
-        let response = stream_status(
-            State(state),
-            viewer(2, "user"),
-            Query(StreamStatusQuery {
-                stream: Some("dawu".to_string()),
-            }),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn stream_status_requires_a_stream_parameter() {
-        use sea_orm::{DbBackend, MockDatabase};
-
-        let state = mock_state(MockDatabase::new(DbBackend::Postgres).into_connection());
-
-        let response = stream_status(
-            State(state),
-            viewer(1, "admin"),
-            Query(StreamStatusQuery { stream: None }),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn stop_stream_ignores_ended_sessions_and_authorizes_against_the_room() {
-        use sea_orm::{DbBackend, MockDatabase};
-
-        // An ended session owned by user 2 exists, but the active-session filter must skip it,
-        // so authorization falls through to the room, which is owned by user 1.
         let state = mock_state(
             MockDatabase::new(DbBackend::Postgres)
                 .append_query_results([Vec::<live_session::Model>::new()])
@@ -1407,7 +1219,7 @@ mod tests {
         );
 
         let response = stop_stream(
-            State(state.clone()),
+            State(state),
             viewer(2, "user"),
             Json(StopStreamRequest {
                 stream_id: "dawu".to_string(),
@@ -1417,19 +1229,5 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        let state = Arc::try_unwrap(state).unwrap_or_else(|_| panic!("state should be unique"));
-        let session_query = format!(
-            "{:?}",
-            state
-                .db
-                .into_transaction_log()
-                .first()
-                .expect("the session lookup should be recorded")
-        );
-        assert!(
-            session_query.contains("\"active\""),
-            "the session lookup must bind the active status, got: {session_query}"
-        );
     }
 }

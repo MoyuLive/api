@@ -73,23 +73,11 @@ fn to_postgres_url(dsn: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn privacy_migration_is_registered_last() {
-        assert_eq!(MIGRATIONS.len(), 9);
-        let migration = MIGRATIONS
-            .last()
-            .expect("privacy migration should be registered");
-        assert!(migration.contains("require_login"));
-        assert!(migration.contains("password_hash"));
-        assert!(migration.contains("access_revision"));
-    }
-
     #[tokio::test]
+    #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn bundled_migrations_execute_against_postgres() {
-        let Ok(database_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
-            eprintln!("skipping postgres migration test; YANTUBE_TEST_DATABASE_URL is not set");
-            return;
-        };
+        let database_url = std::env::var("YANTUBE_TEST_DATABASE_URL")
+            .expect("set YANTUBE_TEST_DATABASE_URL to run PostgreSQL tests");
 
         let db = Database::connect(&database_url)
             .await

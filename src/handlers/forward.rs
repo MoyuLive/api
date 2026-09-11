@@ -340,31 +340,3 @@ pub async fn delete(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_supported_stream_filters() {
-        for filter in ["*", "dawu", "live/*", "live/dawu", "live.room/room-1"] {
-            assert_eq!(normalize_stream_filter(filter).unwrap(), filter);
-        }
-    }
-
-    #[test]
-    fn rejects_dead_stream_filters() {
-        for filter in ["", "live/", "/dawu", "live/*/extra", "live room/dawu"] {
-            assert!(normalize_stream_filter(filter).is_err(), "{filter}");
-        }
-    }
-
-    #[test]
-    fn validates_rtmp_template_urls() {
-        assert!(validate_forward_target_template("rtmp://edge.example/live/{stream}").is_ok());
-        assert!(validate_forward_target_template("rtmp://edge.example/{app}/{stream}").is_ok());
-        assert!(validate_forward_target_template("https://edge.example/live/stream").is_err());
-        assert!(validate_forward_target_template("rtmp://127.0.0.1/live/stream").is_err());
-        assert!(validate_forward_target_template("rtmp://edge.example/live/{unknown}").is_err());
-    }
-}

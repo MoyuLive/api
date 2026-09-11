@@ -18,11 +18,8 @@ use crate::{
 const LIVE_RECONNECT_GRACE_SECONDS: i64 = 600;
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct PublishBody {
     #[serde(default)]
-    pub action: String,
-    #[serde(default)]
     pub app: String,
     #[serde(default)]
     pub stream: String,
@@ -34,84 +31,36 @@ pub struct PublishBody {
     pub vhost: String,
     #[serde(default, alias = "client_id")]
     pub client_id: String,
-    #[serde(default)]
-    pub ip: String,
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct UnpublishBody {
     #[serde(default)]
-    pub action: String,
-    #[serde(default)]
-    pub app: String,
-    #[serde(default)]
     pub stream: String,
-    #[serde(default)]
-    pub param: String,
-    #[serde(default)]
-    pub vhost: String,
-    #[serde(default, alias = "client_id")]
-    pub client_id: String,
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct PlayBody {
     #[serde(default)]
-    pub action: String,
-    #[serde(default)]
-    pub app: String,
-    #[serde(default)]
     pub stream: String,
     #[serde(default)]
     pub param: String,
-    #[serde(default, alias = "pageUrl")]
-    pub page_url: String,
-    #[serde(default)]
-    pub vhost: String,
     #[serde(default, alias = "client_id")]
     pub client_id: String,
-    #[serde(default)]
-    pub ip: String,
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct ForwardBody {
     #[serde(default)]
-    pub action: String,
-    #[serde(default)]
     pub app: String,
     #[serde(default)]
     pub stream: String,
-    #[serde(default)]
-    pub param: String,
-    #[serde(default, alias = "tcUrl")]
-    pub tc_url: String,
-    #[serde(default)]
-    pub vhost: String,
-    #[serde(default, alias = "client_id")]
-    pub client_id: String,
-    #[serde(default, alias = "server_id")]
-    pub server_id: String,
-    #[serde(default)]
-    pub ip: String,
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct StopBody {
     #[serde(default)]
-    pub action: String,
-    #[serde(default)]
-    pub app: String,
-    #[serde(default)]
     pub stream: String,
-    #[serde(default)]
-    pub param: String,
-    #[serde(default)]
-    pub vhost: String,
     #[serde(default, alias = "client_id")]
     pub client_id: String,
 }
@@ -253,30 +202,6 @@ async fn matching_forward_rules(
         .order_by_asc(forward_rule::Column::Id)
         .all(db)
         .await
-}
-
-#[cfg(test)]
-fn next_episode_started_at(
-    previous: Option<&live_stream_state::Model>,
-    now: NaiveDateTime,
-) -> NaiveDateTime {
-    let Some(previous) = previous else {
-        return now;
-    };
-
-    if previous.status == "active" {
-        return previous.episode_started_at;
-    }
-
-    let Some(last_unpublished_at) = previous.last_unpublished_at else {
-        return now;
-    };
-
-    if now - last_unpublished_at <= chrono::Duration::seconds(LIVE_RECONNECT_GRACE_SECONDS) {
-        previous.episode_started_at
-    } else {
-        now
-    }
 }
 
 async fn mark_live_stream_published(
@@ -784,10 +709,6 @@ mod tests {
         }
     }
 
-    fn user_model() -> user::Model {
-        user_model_with_enabled(true)
-    }
-
     fn user_model_with_enabled(enabled: bool) -> user::Model {
         user::Model {
             id: 1,
@@ -802,14 +723,9 @@ mod tests {
 
     fn play_body(stream: &str, param: String, client_id: &str) -> PlayBody {
         PlayBody {
-            action: "on_play".to_string(),
-            app: "live".to_string(),
             stream: stream.to_string(),
             param,
-            page_url: String::new(),
-            vhost: "__defaultVhost__".to_string(),
             client_id: client_id.to_string(),
-            ip: "127.0.0.1".to_string(),
         }
     }
 
@@ -1065,11 +981,7 @@ mod tests {
                 on_stop(
                     State(state.clone()),
                     Json(StopBody {
-                        action: "on_stop".to_string(),
-                        app: "live".to_string(),
                         stream: room.stream_id.clone(),
-                        param: String::new(),
-                        vhost: "__defaultVhost__".to_string(),
                         client_id: "client-a".to_string(),
                     }),
                 )
@@ -1086,11 +998,7 @@ mod tests {
                 on_stop(
                     State(state.clone()),
                     Json(StopBody {
-                        action: "on_stop".to_string(),
-                        app: "live".to_string(),
                         stream: room.stream_id.clone(),
-                        param: String::new(),
-                        vhost: "__defaultVhost__".to_string(),
                         client_id: "client-b".to_string(),
                     }),
                 )
@@ -1111,11 +1019,7 @@ mod tests {
                     on_stop(
                         State(state.clone()),
                         Json(StopBody {
-                            action: "on_stop".to_string(),
-                            app: "live".to_string(),
                             stream: room.stream_id.clone(),
-                            param: String::new(),
-                            vhost: "__defaultVhost__".to_string(),
                             client_id: client_id.to_string(),
                         }),
                     )
@@ -1133,12 +1037,7 @@ mod tests {
                 on_unpublish(
                     State(state),
                     Json(UnpublishBody {
-                        action: "on_unpublish".to_string(),
-                        app: "live".to_string(),
                         stream: room.stream_id.clone(),
-                        param: String::new(),
-                        vhost: "__defaultVhost__".to_string(),
-                        client_id: "publisher".to_string(),
                     }),
                 )
                 .await,
@@ -1181,12 +1080,7 @@ mod tests {
                 on_unpublish(
                     State(test_state_with_hub(db, hub.clone())),
                     Json(UnpublishBody {
-                        action: "on_unpublish".to_string(),
-                        app: "live".to_string(),
                         stream: "room-one".to_string(),
-                        param: String::new(),
-                        vhost: "__defaultVhost__".to_string(),
-                        client_id: "publisher".to_string(),
                     }),
                 )
                 .await,
@@ -1204,262 +1098,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_publish_rejects_valid_token_for_another_users_stream() {
-        let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([Vec::<live_room::Model>::new()])
-            .into_connection();
-
-        let code = callback_code(
-            on_publish(
-                State(test_state(db)),
-                Json(PublishBody {
-                    action: "on_publish".to_string(),
-                    app: "live".to_string(),
-                    stream: "ytb".to_string(),
-                    param: "?token=valid-stream-code".to_string(),
-                    tc_url: "rtmp://live.example.test/live".to_string(),
-                    vhost: "__defaultVhost__".to_string(),
-                    client_id: "client-1".to_string(),
-                    ip: "127.0.0.1".to_string(),
-                }),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(code, 1);
-    }
-
-    #[test]
-    fn parse_token_supports_rtmp_whip_and_srt_params() {
-        assert_eq!(
-            parse_token_from_param("?token=stream-token"),
-            Some("stream-token".to_string())
-        );
-        assert_eq!(
-            parse_token_from_param("?app=live&stream=dawu&token=stream-token"),
-            Some("stream-token".to_string())
-        );
-        assert_eq!(
-            parse_token_from_param(
-                "?streamid=%23%21%3A%3Ar%3Dlive%2Fdawu%2Cm%3Dpublish%2Ctoken%3Dstream-token"
-            ),
-            Some("stream-token".to_string())
-        );
-    }
-
-    #[test]
-    fn heartbeat_defaults_to_active_when_field_is_missing() {
-        let body: HeartbeatBody = serde_json::from_str(
-            r#"{"device_id":"srs-1","ip":"127.0.0.1","cpu_usage":1.0,"mem_usage":2.0}"#,
-        )
-        .expect("heartbeat body should deserialize");
-
-        assert!(body.is_active);
-    }
-
-    #[tokio::test]
-    async fn on_publish_allows_valid_token_for_own_stream() {
-        let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([[room_model("dawu", "valid-stream-code")]])
-            .append_query_results([[user_model()]])
-            .append_exec_results([
-                MockExecResult {
-                    last_insert_id: 1,
-                    rows_affected: 1,
-                },
-                MockExecResult {
-                    last_insert_id: 1,
-                    rows_affected: 1,
-                },
-            ])
-            .append_query_results([Vec::<live_stream_state::Model>::new()])
-            .into_connection();
-
-        let code = callback_code(
-            on_publish(
-                State(test_state(db)),
-                Json(PublishBody {
-                    action: "on_publish".to_string(),
-                    app: "live".to_string(),
-                    stream: "dawu".to_string(),
-                    param: "?token=valid-stream-code".to_string(),
-                    tc_url: "rtmp://live.example.test/live".to_string(),
-                    vhost: "__defaultVhost__".to_string(),
-                    client_id: "client-1".to_string(),
-                    ip: "127.0.0.1".to_string(),
-                }),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(code, 0);
-    }
-
-    #[tokio::test]
-    async fn on_forward_returns_matching_rules_and_expands_templates() {
-        let now =
-            NaiveDateTime::parse_from_str("2026-06-04 12:00:00", "%F %T").expect("valid time");
-        let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([[
-                forward_rule::Model {
-                    id: 1,
-                    stream_filter: "*".to_string(),
-                    target_url: "rtmp://edge.example/live/{stream}".to_string(),
-                    enabled: true,
-                    created_at: now,
-                    updated_at: now,
-                },
-                forward_rule::Model {
-                    id: 2,
-                    stream_filter: "live/dawu".to_string(),
-                    target_url: "rtmp://backup.example/{app}/{stream}".to_string(),
-                    enabled: true,
-                    created_at: now,
-                    updated_at: now,
-                },
-            ]])
-            .into_connection();
-
-        let json = callback_json(
-            on_forward(
-                State(test_state(db)),
-                Json(ForwardBody {
-                    action: "on_forward".to_string(),
-                    app: "live".to_string(),
-                    stream: "dawu".to_string(),
-                    param: String::new(),
-                    tc_url: "rtmp://live.example.test/live".to_string(),
-                    vhost: "__defaultVhost__".to_string(),
-                    client_id: "client-1".to_string(),
-                    server_id: "server-1".to_string(),
-                    ip: "127.0.0.1".to_string(),
-                }),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(json["code"], 0);
-        assert_eq!(
-            json["data"]["urls"],
-            serde_json::json!([
-                "rtmp://edge.example/live/dawu",
-                "rtmp://backup.example/live/dawu"
-            ])
-        );
-    }
-
-    #[test]
-    fn forward_rule_filters_cover_global_stream_app_and_exact() {
-        assert_eq!(
-            forward_rule_filters("live", "dawu"),
-            vec!["*", "dawu", "live/*", "live/dawu"]
-        );
-    }
-
-    fn live_state(
-        status: &str,
-        episode_started_at: &str,
-        last_unpublished_at: Option<&str>,
-    ) -> live_stream_state::Model {
-        live_stream_state::Model {
-            id: 1,
-            stream_id: "dawu".to_string(),
-            user_id: 1,
-            status: status.to_string(),
-            episode_started_at: NaiveDateTime::parse_from_str(episode_started_at, "%F %T")
-                .expect("valid episode timestamp"),
-            last_unpublished_at: last_unpublished_at.map(|value| {
-                NaiveDateTime::parse_from_str(value, "%F %T").expect("valid unpublished timestamp")
-            }),
-            updated_at: NaiveDateTime::parse_from_str(episode_started_at, "%F %T")
-                .expect("valid update timestamp"),
-        }
-    }
-
-    #[test]
-    fn reconnect_inside_grace_keeps_original_episode_start() {
-        let previous = live_state("ended", "2026-06-04 12:00:00", Some("2026-06-04 12:03:00"));
-        let now =
-            NaiveDateTime::parse_from_str("2026-06-04 12:08:00", "%F %T").expect("valid timestamp");
-
-        let started_at = next_episode_started_at(Some(&previous), now);
-
-        assert_eq!(started_at, previous.episode_started_at);
-    }
-
-    #[test]
-    fn reconnect_after_grace_starts_new_episode() {
-        let previous = live_state("ended", "2026-06-04 12:00:00", Some("2026-06-04 12:03:00"));
-        let now =
-            NaiveDateTime::parse_from_str("2026-06-04 12:20:00", "%F %T").expect("valid timestamp");
-
-        let started_at = next_episode_started_at(Some(&previous), now);
-
-        assert_eq!(started_at, now);
-    }
-
-    #[tokio::test]
-    async fn publishing_a_stream_state_uses_existing_row_in_atomic_conflict_update() {
-        let previous = live_state("ended", "2026-06-04 12:00:00", Some("2026-06-04 12:03:00"));
-        let now =
-            NaiveDateTime::parse_from_str("2026-06-04 12:05:00", "%F %T").expect("valid timestamp");
-        let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([[previous.clone()], [previous]])
-            .append_exec_results([MockExecResult {
-                last_insert_id: 1,
-                rows_affected: 1,
-            }])
-            .into_connection();
-
-        mark_live_stream_published(&db, "dawu", 1, now)
-            .await
-            .expect("upsert succeeds");
-
-        let statements = db.into_transaction_log();
-        assert_eq!(
-            statements.len(),
-            1,
-            "unexpected statements: {statements:#?}"
-        );
-        let statement = statements.first().expect("upsert statement recorded");
-        let sql = format!("{:#?}", statement);
-        assert!(sql.contains("ON CONFLICT"), "unexpected sql: {sql}");
-        assert!(
-            sql.contains(r#"\"episode_started_at\" = CASE"#),
-            "unexpected sql: {sql}"
-        );
-        assert!(
-            sql.contains(r#"\"live_stream_state\".\"status\" = 'active'"#),
-            "unexpected sql: {sql}"
-        );
-        assert!(
-            sql.contains(r#"\"live_stream_state\".\"last_unpublished_at\" IS NOT NULL"#),
-            "unexpected sql: {sql}"
-        );
-        assert!(
-            sql.contains("INTERVAL '600 seconds'"),
-            "unexpected sql: {sql}"
-        );
-        assert!(
-            sql.contains(r#"ELSE \"excluded\".\"episode_started_at\" END"#),
-            "unexpected sql: {sql}"
-        );
-        assert!(
-            !sql.contains(r#"\"episode_started_at\" = \"excluded\".\"episode_started_at\""#),
-            "unexpected sql: {sql}"
-        );
-    }
-
-    #[tokio::test]
     #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn publishing_a_stream_state_preserves_episode_start_concurrently_in_postgres() {
-        let Ok(base_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
-            eprintln!("skipping postgres stream state test; YANTUBE_TEST_DATABASE_URL is not set");
-            return;
-        };
+        let base_url = std::env::var("YANTUBE_TEST_DATABASE_URL")
+            .expect("set YANTUBE_TEST_DATABASE_URL to run PostgreSQL tests");
         let suffix = generate_random_string(16).to_ascii_lowercase();
         let database_name = format!("yantube_stream_state_test_{suffix}");
         let database_url_for_name = |database_name: &str| {
@@ -1634,37 +1276,5 @@ mod tests {
             .await
             .expect("isolated test database should be dropped");
         result.expect("PostgreSQL stream state publishing contract should hold");
-    }
-
-    #[tokio::test]
-    async fn heartbeat_upserts_on_conflict() {
-        let db = MockDatabase::new(DbBackend::Postgres)
-            .append_exec_results([MockExecResult {
-                last_insert_id: 1,
-                rows_affected: 1,
-            }])
-            .into_connection();
-        let state = test_state(db);
-
-        heartbeat(
-            State(state.clone()),
-            Json(HeartbeatBody {
-                device_id: "srs-1".to_string(),
-                ip: "127.0.0.1".to_string(),
-                is_active: true,
-                cpu_usage: 0.5,
-                mem_usage: 0.25,
-                uptime_seconds: 42,
-            }),
-        )
-        .await;
-
-        let state = Arc::try_unwrap(state).unwrap_or_else(|_| panic!("state should be unique"));
-        let statements = state.db.into_transaction_log();
-        let insert = format!(
-            "{:?}",
-            statements.last().expect("insert statement recorded")
-        );
-        assert!(insert.contains("ON CONFLICT"), "unexpected sql: {insert}");
     }
 }

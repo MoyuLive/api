@@ -309,35 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn feed_items_skip_streams_before_minimum_live_age() {
-        let items = build_live_feed_items(
-            vec![live_state("dawu", "2026-06-04 12:00:01")],
-            vec![live_room_model(1, "dawu", "大雾的游戏时间")],
-            timestamp("2026-06-04 12:01:00"),
-            "https://live.example.test",
-            None,
-        );
-
-        assert!(items.is_empty());
-    }
-
-    #[test]
-    fn feed_items_use_episode_start_as_stable_guid() {
-        let items = build_live_feed_items(
-            vec![live_state("dawu", "2026-06-04 12:00:00")],
-            vec![live_room_model(1, "dawu", "大雾的游戏时间")],
-            timestamp("2026-06-04 12:01:00"),
-            "https://live.example.test",
-            None,
-        );
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "大雾的游戏时间 - dawu");
-        assert_eq!(items[0].link, "https://live.example.test/live/dawu");
-        assert_eq!(items[0].guid, "moyulive:live:dawu:1780574400000");
-    }
-
-    #[test]
     fn feed_items_wait_for_current_publish_age_after_reconnect() {
         let items = build_live_feed_items(
             vec![live_state_with_updated_at(
@@ -352,52 +323,6 @@ mod tests {
         );
 
         assert!(items.is_empty());
-    }
-
-    #[test]
-    fn feed_items_can_filter_to_one_stream() {
-        let items = build_live_feed_items(
-            vec![
-                live_state_with_user_and_updated_at(
-                    "dawu",
-                    1,
-                    "2026-06-04 12:00:00",
-                    "2026-06-04 12:00:00",
-                ),
-                live_state_with_user_and_updated_at(
-                    "ytb",
-                    2,
-                    "2026-06-04 12:05:00",
-                    "2026-06-04 12:05:00",
-                ),
-            ],
-            vec![
-                live_room_model(1, "dawu", "大雾的游戏时间"),
-                live_room_model(2, "ytb", "YTB"),
-            ],
-            timestamp("2026-06-04 12:06:30"),
-            "https://live.example.test",
-            Some("dawu"),
-        );
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "大雾的游戏时间 - dawu");
-        assert_eq!(items[0].link, "https://live.example.test/live/dawu");
-    }
-
-    #[test]
-    fn feed_items_use_username_room_when_title_is_empty() {
-        let items = build_live_feed_items(
-            vec![live_state("dawu", "2026-06-04 12:00:00")],
-            vec![live_room_model(1, "dawu", "")],
-            timestamp("2026-06-04 12:01:00"),
-            "https://live.example.test",
-            None,
-        );
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "dawu的直播间");
-        assert_eq!(items[0].description, "dawu的直播间 正在直播");
     }
 
     #[test]

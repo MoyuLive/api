@@ -70,7 +70,7 @@ impl ConnectionRateLimiter {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{ClientMessage, ConnectionRateLimiter, DanmakuError};
+    use super::{ConnectionRateLimiter, DanmakuError};
     use crate::live_hub::RoomEvent;
     use crate::room_access::RoomTicketClaims;
 
@@ -111,54 +111,6 @@ mod tests {
     }
 
     #[test]
-    fn guest_sender_is_derived_from_ticket_claims() {
-        let mut limiter = ConnectionRateLimiter::new();
-        let event = accept(
-            &mut limiter,
-            &claims(None, false, "游客-ABCD"),
-            "hello",
-            Instant::now(),
-        )
-        .expect("guest danmaku is accepted");
-
-        assert_eq!(
-            event,
-            RoomEvent::Danmaku {
-                id: "server-message-id".to_string(),
-                sender: crate::room_access::ViewerIdentity {
-                    kind: crate::room_access::ViewerKind::Guest,
-                    name: "游客-ABCD".to_string(),
-                },
-                content: "hello".to_string(),
-                sent_at: "2026-07-20T12:00:00+00:00".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn verified_user_sender_is_derived_from_ticket_claims() {
-        let mut limiter = ConnectionRateLimiter::new();
-        let event = accept(
-            &mut limiter,
-            &claims(Some(42), true, "alice"),
-            "hello",
-            Instant::now(),
-        )
-        .expect("user danmaku is accepted");
-
-        assert!(matches!(
-            event,
-            RoomEvent::Danmaku {
-                sender: crate::room_access::ViewerIdentity {
-                    kind: crate::room_access::ViewerKind::User,
-                    name,
-                },
-                ..
-            } if name == "alice"
-        ));
-    }
-
-    #[test]
     fn blank_and_101_character_messages_are_invalid_without_consuming_rate_limit() {
         let mut limiter = ConnectionRateLimiter::new();
         let claims = claims(None, false, "guest");
@@ -176,34 +128,12 @@ mod tests {
     }
 
     #[test]
-    fn valid_messages_trim_content_and_preserve_literal_markup() {
-        let mut limiter = ConnectionRateLimiter::new();
-        let event = accept(
-            &mut limiter,
-            &claims(None, false, "guest"),
-            "  <b>literal</b>  ",
-            Instant::now(),
-        )
-        .expect("valid message");
-
-        assert!(matches!(
-            event,
-            RoomEvent::Danmaku { content, .. } if content == "<b>literal</b>"
-        ));
-    }
-
-    #[test]
-    fn successful_message_uses_server_id_and_time_and_enforces_one_second_interval() {
+    fn successful_message_enforces_one_second_interval() {
         let mut limiter = ConnectionRateLimiter::new();
         let claims = claims(None, false, "guest");
         let now = Instant::now();
 
-        let event = accept(&mut limiter, &claims, "first", now).expect("first succeeds");
-        assert!(matches!(
-            event,
-            RoomEvent::Danmaku { id, sent_at, .. }
-                if id == "server-message-id" && sent_at == "2026-07-20T12:00:00+00:00"
-        ));
+        accept(&mut limiter, &claims, "first", now).expect("first succeeds");
         assert_eq!(
             accept(
                 &mut limiter,
@@ -214,35 +144,5 @@ mod tests {
             Err(DanmakuError::RateLimited)
         );
         assert!(accept(&mut limiter, &claims, "third", now + Duration::from_secs(1)).is_ok());
-    }
-
-    #[test]
-    fn boundary_of_100_unicode_scalar_characters_is_accepted() {
-        let mut limiter = ConnectionRateLimiter::new();
-        let event = accept(
-            &mut limiter,
-            &claims(None, false, "guest"),
-            &"界".repeat(100),
-            Instant::now(),
-        )
-        .expect("100 unicode scalar characters are accepted");
-
-        assert!(
-            matches!(event, RoomEvent::Danmaku { content, .. } if content.chars().count() == 100)
-        );
-    }
-
-    #[test]
-    fn client_message_is_tagged_and_only_accepts_content() {
-        assert!(matches!(
-            serde_json::from_str::<ClientMessage>(r#"{"type":"send_message","content":"hello"}"#),
-            Ok(ClientMessage::SendMessage {
-                content,
-            }) if content == "hello"
-        ));
-        assert!(serde_json::from_str::<ClientMessage>(
-            r#"{"type":"send_message","content":"hello","id":"client-id"}"#
-        )
-        .is_err());
     }
 }

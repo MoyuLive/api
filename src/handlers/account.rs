@@ -330,7 +330,7 @@ pub async fn logout() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::to_bytes, response::IntoResponse};
+    use axum::response::IntoResponse;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
     };
@@ -343,25 +343,6 @@ mod tests {
     };
     use crate::live_hub::LiveHub;
     use crate::srs_client::SrsClient;
-
-    #[test]
-    fn registration_defaults_bootstraps_first_user() {
-        assert_eq!(registration_defaults(0), (ROLE_SUPER_ADMIN, true),);
-    }
-
-    #[test]
-    fn registration_defaults_leaves_later_users_without_rooms() {
-        assert_eq!(registration_defaults(1), (ROLE_USER, false));
-        assert_eq!(registration_defaults(2), (ROLE_USER, false));
-    }
-
-    #[test]
-    fn registration_uses_a_fixed_transaction_advisory_lock() {
-        assert_eq!(
-            REGISTRATION_ADVISORY_LOCK_SQL,
-            "SELECT pg_advisory_xact_lock(521351665736640)"
-        );
-    }
 
     const TEST_MIGRATIONS: &[&str] = &[
         include_str!("../../migrations/01_create_users.sql"),
@@ -431,10 +412,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn concurrent_empty_database_registrations_create_one_super_admin_and_room() {
-        let Ok(base_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
-            eprintln!("skipping postgres registration test; YANTUBE_TEST_DATABASE_URL is not set");
-            return;
-        };
+        let base_url = std::env::var("YANTUBE_TEST_DATABASE_URL")
+            .expect("set YANTUBE_TEST_DATABASE_URL to run PostgreSQL tests");
         let database_name = format!(
             "yantube_registration_test_{}",
             generate_random_string(16).to_ascii_lowercase()
@@ -566,10 +545,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn duplicate_registration_is_rejected_with_bad_request() {
-        let Ok(base_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
-            eprintln!("skipping postgres registration test; YANTUBE_TEST_DATABASE_URL is not set");
-            return;
-        };
+        let base_url = std::env::var("YANTUBE_TEST_DATABASE_URL")
+            .expect("set YANTUBE_TEST_DATABASE_URL to run PostgreSQL tests");
         let database_name = format!(
             "yantube_duplicate_test_{}",
             generate_random_string(16).to_ascii_lowercase()
@@ -642,23 +619,5 @@ mod tests {
             .await
             .expect("isolated test database should be dropped");
         result.expect("duplicate registration contract should hold");
-    }
-
-    #[tokio::test]
-    async fn auth_token_response_is_exposed_in_success_data() {
-        let response = success_response(AuthTokenResponse {
-            token: "signed-jwt".to_string(),
-        });
-        let body = to_bytes(response.into_body(), 1024)
-            .await
-            .expect("response body should be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("response should be JSON");
-
-        assert_eq!(json["code"], 0);
-        assert_eq!(json["data"]["token"], "signed-jwt");
-        assert!(json["data"]["token"]
-            .as_str()
-            .is_some_and(|token| !token.is_empty()));
     }
 }

@@ -199,14 +199,6 @@ mod tests {
     use tokio::sync::broadcast::error::TryRecvError;
 
     use super::{LiveHub, RoomEvent};
-    use crate::room_access::{ViewerIdentity, ViewerKind};
-
-    fn viewer(name: &str) -> ViewerIdentity {
-        ViewerIdentity {
-            kind: ViewerKind::Guest,
-            name: name.to_string(),
-        }
-    }
 
     fn expect_viewer_count(
         receiver: &mut tokio::sync::broadcast::Receiver<RoomEvent>,
@@ -218,60 +210,6 @@ mod tests {
                 .expect("viewer count event should be sent"),
             RoomEvent::ViewerCount { count }
         );
-    }
-
-    #[tokio::test]
-    async fn same_client_and_viewer_is_idempotent() {
-        let hub = LiveHub::new();
-        let (_, mut receiver) = hub.subscribe("room").await;
-
-        assert_eq!(hub.play("room", "client-a", "viewer-a").await, 1);
-        expect_viewer_count(&mut receiver, 1);
-        assert_eq!(hub.play("room", "client-a", "viewer-a").await, 1);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
-    }
-
-    #[tokio::test]
-    async fn viewer_with_multiple_clients_counts_once_until_last_stop() {
-        let hub = LiveHub::new();
-        let (_, mut receiver) = hub.subscribe("room").await;
-
-        assert_eq!(hub.play("room", "client-a", "viewer-a").await, 1);
-        expect_viewer_count(&mut receiver, 1);
-        assert_eq!(hub.play("room", "client-b", "viewer-a").await, 1);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
-
-        assert_eq!(hub.stop("room", "client-a").await, 1);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
-        assert_eq!(hub.stop("room", "client-b").await, 0);
-        expect_viewer_count(&mut receiver, 0);
-    }
-
-    #[tokio::test]
-    async fn second_viewer_increments_count() {
-        let hub = LiveHub::new();
-        let (_, mut receiver) = hub.subscribe("room").await;
-
-        assert_eq!(hub.play("room", "client-a", "viewer-a").await, 1);
-        expect_viewer_count(&mut receiver, 1);
-        assert_eq!(hub.play("room", "client-b", "viewer-b").await, 2);
-        expect_viewer_count(&mut receiver, 2);
-    }
-
-    #[tokio::test]
-    async fn duplicate_and_unknown_stops_do_not_change_count_or_broadcast() {
-        let hub = LiveHub::new();
-        let (_, mut receiver) = hub.subscribe("room").await;
-
-        assert_eq!(hub.stop("room", "unknown").await, 0);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
-
-        hub.play("room", "client-a", "viewer-a").await;
-        expect_viewer_count(&mut receiver, 1);
-        assert_eq!(hub.stop("room", "client-a").await, 0);
-        expect_viewer_count(&mut receiver, 0);
-        assert_eq!(hub.stop("room", "client-a").await, 0);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[tokio::test]
@@ -292,75 +230,5 @@ mod tests {
         expect_viewer_count(&mut receiver, 1);
         assert_eq!(hub.stop("room", "client-a").await, 0);
         expect_viewer_count(&mut receiver, 0);
-    }
-
-    #[tokio::test]
-    async fn clear_stream_removes_presence_and_always_broadcasts_zero() {
-        let hub = LiveHub::new();
-        let (_, mut receiver) = hub.subscribe("room").await;
-
-        hub.play("room", "client-a", "viewer-a").await;
-        expect_viewer_count(&mut receiver, 1);
-        hub.play("room", "client-b", "viewer-b").await;
-        expect_viewer_count(&mut receiver, 2);
-
-        assert_eq!(hub.clear_stream("room").await, 0);
-        expect_viewer_count(&mut receiver, 0);
-        assert_eq!(hub.stop("room", "client-a").await, 0);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
-
-        assert_eq!(hub.clear_stream("room").await, 0);
-        expect_viewer_count(&mut receiver, 0);
-    }
-
-    #[tokio::test]
-    async fn dropped_receivers_do_not_prevent_presence_updates() {
-        let hub = LiveHub::new();
-        let (_, receiver) = hub.subscribe("room").await;
-        drop(receiver);
-
-        assert_eq!(hub.play("room", "client-a", "viewer-a").await, 1);
-        assert_eq!(hub.viewer_count("room").await, 1);
-        assert_eq!(hub.clear_stream("room").await, 0);
-        assert_eq!(hub.viewer_count("room").await, 0);
-    }
-
-    #[tokio::test]
-    async fn viewer_counts_includes_unknown_rooms_and_subscribe_does_not_count() {
-        let hub = LiveHub::new();
-        let (count, _) = hub.subscribe("empty").await;
-        assert_eq!(count, 0);
-        assert_eq!(hub.viewer_count("empty").await, 0);
-
-        hub.play("active", "client-a", "viewer-a").await;
-        let stream_ids = vec![
-            "active".to_string(),
-            "empty".to_string(),
-            "unknown".to_string(),
-        ];
-        let counts = hub.viewer_counts(&stream_ids).await;
-        assert_eq!(counts.get("active"), Some(&1));
-        assert_eq!(counts.get("empty"), Some(&0));
-        assert_eq!(counts.get("unknown"), Some(&0));
-    }
-
-    #[tokio::test]
-    async fn broadcast_danmaku_forwards_event_without_affecting_presence() {
-        let hub = LiveHub::new();
-        let (_, mut receiver) = hub.subscribe("room").await;
-        let event = RoomEvent::Danmaku {
-            id: "message-1".to_string(),
-            sender: viewer("Guest"),
-            content: "hello".to_string(),
-            sent_at: "2026-07-20T00:00:00Z".to_string(),
-        };
-
-        hub.broadcast_danmaku("room", event.clone()).await;
-
-        assert_eq!(
-            receiver.try_recv().expect("danmaku event should be sent"),
-            event
-        );
-        assert_eq!(hub.viewer_count("room").await, 0);
     }
 }

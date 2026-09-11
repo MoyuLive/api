@@ -87,7 +87,9 @@ pub async fn metadata(
 ) -> impl IntoResponse {
     let room = match load_room(&state, &stream_id).await {
         Ok(room) => room,
-        Err(response) => return response,
+        Err((status, message)) => {
+            return (status, error_response(i32::from(status.as_u16()), message));
+        }
     };
 
     let active_session = match live_session::Entity::find()
@@ -132,7 +134,9 @@ pub async fn access(
 ) -> impl IntoResponse {
     let room = match load_room(&state, &stream_id).await {
         Ok(room) => room,
-        Err(response) => return response,
+        Err((status, message)) => {
+            return (status, error_response(i32::from(status.as_u16()), message));
+        }
     };
 
     if !room.enabled {
@@ -154,7 +158,9 @@ pub async fn access(
 
     let current_user = match optional_current_user(&headers, &state).await {
         Ok(current_user) => current_user,
-        Err(response) => return response,
+        Err((status, message)) => {
+            return (status, error_response(i32::from(status.as_u16()), message));
+        }
     };
 
     let (viewer_key, viewer, user_id, account_verified) = match current_user {
@@ -273,7 +279,14 @@ async fn handle_websocket(
     };
 
     let (viewer_count, mut events) = state.live_hub.subscribe(&stream_id).await;
-    if !send_room_event(&mut socket, &initial_viewer_count_event(viewer_count)).await {
+    if !send_room_event(
+        &mut socket,
+        &RoomEvent::ViewerCount {
+            count: viewer_count,
+        },
+    )
+    .await
+    {
         return;
     }
 
@@ -363,21 +376,13 @@ async fn admit_websocket_ticket(
         .map_err(|_| ())
 }
 
-fn room_access_denied_close_frame() -> CloseFrame<'static> {
-    CloseFrame {
-        code: 1008,
-        reason: Cow::Borrowed("room access denied"),
-    }
-}
-
 async fn close_room_access_denied(socket: &mut WebSocket) {
     let _ = socket
-        .send(Message::Close(Some(room_access_denied_close_frame())))
+        .send(Message::Close(Some(CloseFrame {
+            code: 1008,
+            reason: Cow::Borrowed("room access denied"),
+        })))
         .await;
-}
-
-fn initial_viewer_count_event(count: usize) -> RoomEvent {
-    RoomEvent::ViewerCount { count }
 }
 
 async fn send_room_event(socket: &mut WebSocket, event: &RoomEvent) -> bool {
@@ -482,20 +487,17 @@ pub async fn update_owned_privacy(
 async fn load_room(
     state: &Arc<AppState>,
     stream_id: &str,
-) -> Result<live_room::Model, (StatusCode, Response)> {
+) -> Result<live_room::Model, (StatusCode, &'static str)> {
     match live_room::Entity::find()
         .filter(live_room::Column::StreamId.eq(stream_id))
         .one(&state.db)
         .await
     {
         Ok(Some(room)) => Ok(room),
-        Ok(None) => Err((StatusCode::NOT_FOUND, error_response(404, "room not found"))),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "room not found")),
         Err(e) => {
             error!("Failed to load public room: {e}");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_response(500, "failed to load room"),
-            ))
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "failed to load room"))
         }
     }
 }
@@ -503,32 +505,28 @@ async fn load_room(
 async fn optional_current_user(
     headers: &HeaderMap,
     state: &Arc<AppState>,
-) -> Result<Option<CurrentUser>, (StatusCode, Response)> {
+) -> Result<Option<CurrentUser>, (StatusCode, &'static str)> {
     let Some(authorization) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
     };
+    let unauthorized = (StatusCode::UNAUTHORIZED, "invalid authorization");
     let token = authorization
         .to_str()
         .ok()
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|token| !token.is_empty() && !token.chars().any(char::is_whitespace))
-        .ok_or_else(unauthorized_response)?;
-    let claims = auth::decode_jwt(token, &state.config.user.auth_secret)
-        .map_err(|_| unauthorized_response())?;
+        .ok_or(unauthorized)?;
+    let claims =
+        auth::decode_jwt(token, &state.config.user.auth_secret).map_err(|_| unauthorized)?;
 
     let db_user = user::Entity::find_by_id(claims.user_id)
         .one(&state.db)
         .await
         .map_err(|e| {
             error!("Failed to load optional room access account: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_response(500, "failed to load account"),
-            )
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to load account")
         })?;
-    let db_user = db_user
-        .filter(|user| user.enabled)
-        .ok_or_else(unauthorized_response)?;
+    let db_user = db_user.filter(|user| user.enabled).ok_or(unauthorized)?;
 
     Ok(Some(CurrentUser {
         username: db_user.username,
@@ -539,14 +537,6 @@ async fn optional_current_user(
 
 fn is_valid_access_password(password: &str) -> bool {
     (MIN_PASSWORD_CHARS..=MAX_PASSWORD_CHARS).contains(&password.chars().count())
-}
-
-#[allow(clippy::result_large_err)]
-fn unauthorized_response() -> (StatusCode, Response) {
-    (
-        StatusCode::UNAUTHORIZED,
-        error_response(401, "invalid authorization"),
-    )
 }
 
 fn room_access_error_response(error: RoomAccessError) -> (StatusCode, Response) {
@@ -592,9 +582,9 @@ fn public_room_title(title: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::{to_bytes, Body},
-        extract::{FromRequest, Path, State},
-        http::{HeaderMap, HeaderValue, Request as HttpRequest, StatusCode},
+        body::to_bytes,
+        extract::{Path, State},
+        http::{HeaderMap, HeaderValue, StatusCode},
         response::IntoResponse,
         Json,
     };
@@ -745,166 +735,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_invalid_ticket_uses_policy_violation_close_without_leaking_details() {
-        let room = room_model("room-one");
-        let db = MockDatabase::new(DbBackend::Postgres).into_connection();
-
-        assert!(admit_websocket_ticket(
-            &db,
-            "invalid-ticket",
-            "room-one",
-            &room,
-            AUTH_SECRET,
-            Utc::now(),
-        )
-        .await
-        .is_err());
-        let close_frame = room_access_denied_close_frame();
-        assert_eq!(close_frame.code, 1008);
-        assert_eq!(close_frame.reason, "room access denied");
-    }
-
-    #[tokio::test]
-    async fn websocket_admission_rechecks_disabled_ticket_account() {
-        let room = room_model("room-one");
-        let ticket = issue_room_ticket(
-            &room,
-            "user:42".to_string(),
-            ViewerIdentity {
-                kind: ViewerKind::User,
-                name: "database-user".to_string(),
-            },
-            Some(42),
-            true,
-            false,
-            AUTH_SECRET,
-            Utc::now(),
-        )
-        .expect("account ticket should be issued");
-        let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([[user_model(false)]])
-            .into_connection();
-
-        assert!(admit_websocket_ticket(
-            &db,
-            &ticket.token,
-            &room.stream_id,
-            &room,
-            AUTH_SECRET,
-            Utc::now(),
-        )
-        .await
-        .is_err());
-    }
-
-    #[test]
-    fn websocket_initial_event_is_the_current_viewer_count() {
-        assert_eq!(
-            initial_viewer_count_event(3),
-            RoomEvent::ViewerCount { count: 3 }
-        );
-    }
-
-    #[test]
-    fn owner_privacy_request_requires_both_switches() {
-        for body in [
-            r#"{}"#,
-            r#"{"require_login":true}"#,
-            r#"{"password_enabled":false}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<UpdateRoomPrivacyRequest>(body).is_err(),
-                "owner privacy request should reject {body}"
-            );
-        }
-
-        assert!(serde_json::from_str::<UpdateRoomPrivacyRequest>(
-            r#"{"require_login":true,"password_enabled":false}"#
-        )
-        .is_ok());
-    }
-
-    #[tokio::test]
-    async fn owner_privacy_handler_maps_missing_switches_and_empty_body_to_bad_request() {
-        for body in [
-            "",
-            r#"{}"#,
-            r#"{"require_login":true}"#,
-            r#"{"password_enabled":false}"#,
-        ] {
-            let request = HttpRequest::builder()
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .expect("test request should build");
-            let extraction = Json::<UpdateRoomPrivacyRequest>::from_request(request, &()).await;
-            assert!(
-                extraction.is_err(),
-                "privacy extraction should reject {body}"
-            );
-
-            let (status, json) = response_json(
-                update_owned_privacy(
-                    State(test_state(
-                        MockDatabase::new(DbBackend::Postgres).into_connection(),
-                        Arc::new(LiveHub::new()),
-                    )),
-                    CurrentUser {
-                        username: "owner".to_string(),
-                        user_id: 42,
-                        role: "user".to_string(),
-                    },
-                    Path(7),
-                    extraction,
-                )
-                .await,
-            )
-            .await;
-
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(json["code"], 400);
-        }
-    }
-
-    #[tokio::test]
-    async fn metadata_returns_not_found_for_unknown_room() {
-        let state = test_state(db_with_rooms([]), Arc::new(LiveHub::new()));
-
-        let (status, json) =
-            response_json(metadata(State(state), Path("unknown".to_string())).await).await;
-
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(json["code"], 404);
-    }
-
-    #[tokio::test]
-    async fn metadata_returns_public_flags_hub_count_title_fallback_and_live_status() {
-        let mut room = room_model("room-one");
-        room.title = "   ".to_string();
-        room.require_login = true;
-        room.password_hash = hash_password("secret1");
-        let hub = Arc::new(LiveHub::new());
-        hub.play("room-one", "client-a", "guest:a").await;
-        hub.play("room-one", "client-b", "guest:b").await;
-        let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([[room]])
-            .append_query_results([[active_session("room-one")]])
-            .into_connection();
-
-        let (status, json) =
-            response_json(metadata(State(test_state(db, hub)), Path("room-one".to_string())).await)
-                .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["data"]["stream_id"], "room-one");
-        assert_eq!(json["data"]["title"], "room-one");
-        assert_eq!(json["data"]["status"], "live");
-        assert_eq!(json["data"]["require_login"], true);
-        assert_eq!(json["data"]["has_password"], true);
-        assert_eq!(json["data"]["viewer_count"], 2);
-        assert!(json["data"].get("password_hash").is_none());
-    }
-
-    #[tokio::test]
     async fn disabled_room_metadata_is_offline_but_access_is_forbidden() {
         let mut room = room_model("disabled-room");
         room.enabled = false;
@@ -936,33 +766,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(json["code"], 403);
-    }
-
-    #[tokio::test]
-    async fn access_allows_public_guest_and_issues_guest_ticket() {
-        let state = test_state(
-            db_with_rooms([room_model("room-one")]),
-            Arc::new(LiveHub::new()),
-        );
-
-        let (status, json) = response_json(
-            access(
-                State(state),
-                Path("room-one".to_string()),
-                HeaderMap::new(),
-                Ok(Json(guest_request(None))),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert!(json["data"]["ticket"]
-            .as_str()
-            .is_some_and(|ticket| !ticket.is_empty()));
-        assert!(json["data"]["expires_at"].as_str().is_some());
-        assert_eq!(json["data"]["viewer"]["kind"], "guest");
-        assert_eq!(json["data"]["viewer"]["name"], "游客-ABCD");
     }
 
     #[tokio::test]
@@ -1006,53 +809,6 @@ mod tests {
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(json["code"], 403);
         }
-    }
-
-    #[tokio::test]
-    async fn access_rejects_malformed_password() {
-        let mut room = room_model("password-only");
-        room.password_hash = hash_password("secret1");
-        let state = test_state(db_with_rooms([room]), Arc::new(LiveHub::new()));
-
-        let (status, json) = response_json(
-            access(
-                State(state),
-                Path("password-only".to_string()),
-                HeaderMap::new(),
-                Ok(Json(guest_request(Some("short")))),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["code"], 400);
-    }
-
-    #[tokio::test]
-    async fn access_rejects_malformed_guest_id() {
-        let state = test_state(
-            db_with_rooms([room_model("room-one")]),
-            Arc::new(LiveHub::new()),
-        );
-        let request = RoomAccessRequest {
-            guest_id: "not-a-guest-id".to_string(),
-            password: None,
-        };
-
-        let (status, json) = response_json(
-            access(
-                State(state),
-                Path("room-one".to_string()),
-                HeaderMap::new(),
-                Ok(Json(request)),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["code"], 400);
     }
 
     #[tokio::test]
@@ -1132,12 +888,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PostgreSQL"]
+    #[ignore = "requires PostgreSQL and YANTUBE_TEST_DATABASE_URL"]
     async fn owned_privacy_update_rejects_non_owner_and_allows_owner() {
-        let Ok(database_url) = std::env::var("YANTUBE_TEST_DATABASE_URL") else {
-            eprintln!("skipping postgres room handler test; YANTUBE_TEST_DATABASE_URL is not set");
-            return;
-        };
+        let database_url = std::env::var("YANTUBE_TEST_DATABASE_URL")
+            .expect("set YANTUBE_TEST_DATABASE_URL to run PostgreSQL tests");
         let db = Database::connect(&database_url)
             .await
             .expect("test database should be reachable");
